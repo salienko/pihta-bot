@@ -302,10 +302,8 @@ async def callback_handler(call:CallbackQuery):
         elif action=='cartinfo':
             await call.answer('Нажимайте «−» и «+», чтобы изменить количество.');return
         elif action in ('csend','cdiscard'):
-            ident,token=value.split(':');state,d=await db.session(actor)
-            if state!='cart' or d.get('booking')!=ident or d.get('token')!=token:raise RuleError('Эта корзина уже обработана или устарела.')
-            if action=='csend':await db.service_basket(actor,ident,d['cart'],f'basket:{actor}:{ident}:{token}')
-            await db.set_session(actor,'',{})
+            ident,token=value.split(':')
+            await db.finish_cart(actor,ident,token,action=='csend')
             await message.answer('Все выбранные услуги отправлены на подтверждение.' if action=='csend' else 'Выбор услуг отменён.')
             await show_order(message,ident,actor)
         elif action=='svc':

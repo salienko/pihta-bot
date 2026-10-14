@@ -89,20 +89,33 @@ class Store:
 
     async def service_basket(self,actor,ident,selection,operation):
         async with self.write() as c:
-            b=await self.get(ident,actor,c)
-            if b['status'] not in ('held','payment_review','review_overdue','confirmed','in_progress'):raise RuleError('Заказ закрыт. Свяжитесь с администратором.')
-            if not selection:raise RuleError('Выберите хотя бы одну услугу.')
-            existing=await c.fetchval("SELECT EXISTS(SELECT 1 FROM booking_service WHERE operation_key LIKE $1)",operation+':%')
-            if existing:return
-            lines=[]
-            for code,qty in selection.items():
-                if not isinstance(qty,int) or not 1<=qty<=100:raise RuleError('Количество каждой услуги от 1 до 100.')
-                item=await c.fetchrow('SELECT * FROM service_catalog WHERE code=$1 AND active',code)
-                if not item:raise RuleError('Одна из услуг больше недоступна. Проверьте корзину.')
-                await c.execute('INSERT INTO booking_service(id,booking_id,code,name,quantity,price,operation_key) VALUES($1,$2,$3,$4,$5,$6,$7)',uid(),ident,code,item['name'],qty,item['price'],operation+':'+code)
-                lines.append(f'{item["name"]} × {qty}')
-            await self.notify_staff(c,'Корзина услуг:\n'+'\n'.join(lines)+f'\n/order {ident}',f'basket:{operation}')
-            await self.audit(c,actor,'request_service_basket',ident,selection)
+            await self._service_basket(c,actor,ident,selection,operation)
+
+    async def finish_cart(self,actor,ident,token,submit=True):
+        async with self.write() as c:
+            session=await c.fetchrow('SELECT state,data FROM ui_session WHERE telegram_id=$1 FOR UPDATE',actor)
+            d=json.loads(session['data']) if session else {}
+            if not session or session['state']!='cart' or d.get('booking')!=ident or d.get('token')!=token:
+                raise RuleError('Эта корзина уже обработана или устарела.')
+            await self.get(ident,actor,c)
+            if submit:await self._service_basket(c,actor,ident,d['cart'],f'basket:{actor}:{ident}:{token}')
+            await c.execute("UPDATE ui_session SET state='',data='{}'::jsonb,updated_at=now() WHERE telegram_id=$1",actor)
+
+    async def _service_basket(self,c,actor,ident,selection,operation):
+        b=await self.get(ident,actor,c)
+        if b['status'] not in ('held','payment_review','review_overdue','confirmed','in_progress'):raise RuleError('Заказ закрыт. Свяжитесь с администратором.')
+        if not selection:raise RuleError('Выберите хотя бы одну услугу.')
+        existing=await c.fetchval("SELECT EXISTS(SELECT 1 FROM booking_service WHERE operation_key LIKE $1)",operation+':%')
+        if existing:return
+        lines=[]
+        for code,qty in selection.items():
+            if not isinstance(qty,int) or not 1<=qty<=100:raise RuleError('Количество каждой услуги от 1 до 100.')
+            item=await c.fetchrow('SELECT * FROM service_catalog WHERE code=$1 AND active',code)
+            if not item:raise RuleError('Одна из услуг больше недоступна. Проверьте корзину.')
+            await c.execute('INSERT INTO booking_service(id,booking_id,code,name,quantity,price,operation_key) VALUES($1,$2,$3,$4,$5,$6,$7)',uid(),ident,code,item['name'],qty,item['price'],operation+':'+code)
+            lines.append(f'{item["name"]} × {qty}')
+        await self.notify_staff(c,'Корзина услуг:\n'+'\n'.join(lines)+f'\n/order {ident}',f'basket:{operation}')
+        await self.audit(c,actor,'request_service_basket',ident,selection)
 
     async def cart_adjust(self,actor,ident,code,token,delta):
         async with self.write() as c:

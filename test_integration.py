@@ -125,6 +125,24 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data['cart']['towel'],2)
         with self.assertRaises(RuleError):await self.db.cart_adjust(2,ident,'towel','stale',1)
 
+    async def test_finish_cart_once_with_current_quantity(self):
+        ident=await self.create()
+        await self.db.set_session(2,'cart',{'booking':ident,'cart':{'towel':1},'token':'token'})
+        await self.db.cart_adjust(2,ident,'towel','token',1)
+        results=await asyncio.gather(self.db.finish_cart(2,ident,'token'),self.db.finish_cart(2,ident,'token'),return_exceptions=True)
+        self.assertEqual(sum(isinstance(r,RuleError) for r in results),1)
+        self.assertEqual(await self.pool.fetchval('SELECT quantity FROM booking_service'),2)
+        self.assertEqual((await self.db.session(2))[0],'')
+        with self.assertRaises(RuleError):await self.db.cart_adjust(2,ident,'towel','token',1)
+
+    async def test_empty_cart_stays_open(self):
+        ident=await self.create()
+        await self.db.set_session(2,'cart',{'booking':ident,'cart':{},'token':'token'})
+        with self.assertRaises(RuleError):await self.db.finish_cart(2,ident,'token')
+        self.assertEqual((await self.db.session(2))[0],'cart')
+        await self.db.finish_cart(2,ident,'token',False)
+        self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM booking_service'),0)
+
     async def test_backup_restore_in_empty_schema(self):
         import gzip,json,tempfile
         from backup import snapshot,TABLES
