@@ -15,11 +15,20 @@ OWNER=int(os.getenv('OWNER_TELEGRAM_ID','0'))
 BOOKING_ENABLED=os.getenv('BOOKING_ENABLED','false').lower()=='true'
 db=None
 dp=Dispatcher()
-MENU=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=x) for x in row] for row in [('Забронировать','Мои бронирования'),('Цены','Услуги'),('Правила','О бане'),('Связаться с нами',)]],resize_keyboard=True)
+MENU=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=x) for x in row] for row in [('Забронировать','Корзина'),('Мои бронирования','Услуги'),('Цены',),('Правила','О бане'),('Связаться с нами',)]],resize_keyboard=True)
 STATUS={'held':'Резерв, ожидается оплата','payment_review':'Оплата на проверке','review_overdue':'Проверка задерживается, время сохранено','confirmed':'Подтверждена','in_progress':'Сеанс идёт','completed':'Сеанс завершён','cancelled':'Отменена','expired':'Резерв истёк','rejected':'Отклонена'}
 
 def kb(rows):
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t,callback_data=d) for t,d in row] for row in rows])
+
+def shop():
+    import sys
+    from checkout import CheckoutUI
+    return CheckoutUI(sys.modules[__name__])
+
+async def orders(message,actor):
+    rows=await db.pool.fetch('SELECT id,start_at,status FROM booking WHERE guest_id=$1 ORDER BY start_at DESC LIMIT 20',actor)
+    await message.answer('Ваши бронирования' if rows else 'У вас пока нет бронирований.',reply_markup=kb([[(r['start_at'].astimezone(TZ).strftime('%d.%m %H:%M')+' · '+STATUS[r['status']],f'order:{r["id"]}')] for r in rows]+[[('Главное меню','home')]]))
 
 async def chunks(message,text,markup=None):
     parts=[text[i:i+3500] for i in range(0,len(text),3500)]
@@ -84,14 +93,17 @@ async def show_order(message,ident,actor):
     if lines:text+='\nУслуги:\n'+'\n'.join(lines)
     buttons=[]
     if b['status']=='held':text+=f'\nРезерв до {b["release_at"].astimezone(TZ):%H:%M}. Заявите оплату за 15 минут; без заявления резерв освобождается через 20 минут.'
+    if not b['duration_approved']:text+='\nДлительность ожидает подтверждения администратора.\nПлатёжную ссылку передадут после решения.'
     live=b['status'] in ('held','payment_review','review_overdue','confirmed','in_progress')
     if actor==b['guest_id'] and live:
         if left:
             buttons.append([('Запросить ссылку для оплаты',f'link:{ident}')])
             buttons.append([('Я оплатил' if b['status']=='held' else 'Доплатить',f'pay:{ident}')])
         buttons.append([('Добавить услуги',f'services:{ident}')])
-        if b['status']!='held':buttons.append([('Запрос отмены',f'cancel:{ident}'),('Запрос переноса',f'move:{ident}')])
-    if actor==b['guest_id'] and b['status']=='expired':buttons.append([('Заплатить сейчас',f'paynow:{ident}')])
+        buttons.append([('Запрос отмены',f'cancel:{ident}'),('Запрос переноса',f'move:{ident}')])
+    if actor==b['guest_id'] and b['status']=='expired':
+        if b['start_at']>=now()+timedelta(hours=1):buttons.append([('Заплатить сейчас',f'paynow:{ident}')])
+        else:buttons.append([('Выбрать новый сеанс','dates:0')])
     if await db.role(actor):
         text+=f'\nГость: {b["name"]}, {b["phone"]}, Telegram ID {b["guest_id"]}'
         for c in await db.pool.fetch("SELECT * FROM payment_claim WHERE booking_id=$1 AND status='pending'",ident):
@@ -100,19 +112,30 @@ async def show_order(message,ident,actor):
         for r in rows:
             if r['status']=='requested':buttons.append([(f'Да: {r["name"]} × {r["quantity"]}',f'sa:{r["id"]}'),('Нет',f'sr:{r["id"]}')])
         for r in await db.pool.fetch("SELECT * FROM change_request WHERE booking_id=$1 AND status='pending'",ident):
-            text+=f'\nЗапрос {r["kind"]}: {r["id"]}\n{r["target"]}'
-            buttons.append([('Одобрить запрос',f'ca:{r["id"]}'),('Отклонить запрос',f'cr:{r["id"]}')])
+            label={'cancel':'отмены','move':'переноса','no_show':'отметки неявки'}[r['kind']]
+            text+=f'\nЗапрос {label}: {r["id"]}\n{r["target"]}'
+            buttons.append([('Указать время и одобрить' if r['kind']=='move' else 'Одобрить запрос',f'ca:{r["id"]}'),('Отклонить запрос',f'cr:{r["id"]}')])
+        for r in await db.pool.fetch("SELECT * FROM duration_request WHERE booking_id=$1 AND status='pending'",ident):
+            text+=f'\nЗапрос длительности: {r["target_hours"]} ч.'
+            buttons.append([('Подтвердить длительность',f'da:{r["id"]}'),('Отклонить',f'dr:{r["id"]}')])
         for r in await db.pool.fetch("SELECT * FROM payment_link_request WHERE booking_id=$1 AND status='pending'",ident):buttons.append([('Передать ссылку гостю',f'sendlink:{r["id"]}')])
         if b['status'] in ('held','payment_review','review_overdue'):buttons.append([('Отклонить бронь и освободить',f'rejectask:{ident}')])
         if b['status'] in ('confirmed','in_progress'):buttons.append([('Сообщить о неявке',f'noshow:{ident}')])
-    await chunks(message,text,kb(buttons) if buttons else None)
+    buttons.append([('Мои бронирования','orders'),('Главное меню','home')])
+    await chunks(message,text,kb(buttons))
 
 async def admin_panel(message,actor):
     if not await db.role(actor):raise RuleError('Нет доступа к админ панели.')
     await message.answer('Админ панель',reply_markup=kb([[('Ближайшие брони','admin:list'),('Ожидают решения','admin:pending')],[('Ручная бронь','admin:manual'),('Блокировка времени','admin:block')],[('Праздники и Новый год','admin:holiday'),('Возвраты без PayKeeper','admin:refund')],[('Услуги и цены','admin:catalog'),('Роли','admin:roles')]]))
 
 async def summary(message,actor):
-    state,data=await db.session(actor);start=datetime.fromisoformat(data['start'])
+    state,data=await db.session(actor)
+    if data.get('checkout_token'):
+        await shop().store.contacts(actor,data['checkout_token'],data)
+        await db.set_session(actor,'',{})
+        await shop().cart(message,actor,data['checkout_token'])
+        return
+    start=datetime.fromisoformat(data['start'])
     amount,_=await db.quote(start,data['hours'],data['guests'],data['children']);data['quote']=amount
     await db.set_session(actor,'consent',data);agreed=data.get('consent',False)
     await message.answer(f'Сеанс {start:%d.%m.%Y %H:%M}, {data["hours"]} ч.\nВсего гостей {data["guests"]}, детей до 6 {data["children"]}.\n{data["name"]}, {data["phone"]}\nАренда и гости {rub(amount)}. Предоплата 2000 ₽ в счёт заказа. Услуги можно добавить после создания резерва.\nОтмена и перенос по одобрению администратора; за ≥3 часа полный возврат, позднее возможны подтверждённые расходы на подготовку после проверки.\nОзнакомьтесь с правилами до оплаты.',reply_markup=kb([[('Прочитать правила','rules')],[(('☑' if agreed else '□')+' Я ознакомился и согласен с правилами бани „Пихта“','consent')],[('Создать резерв на 20 минут','hold')]]))
@@ -133,18 +156,17 @@ async def message_handler(message:Message):
         if text=='Правила':await chunks(message,RULES);return
         if text=='Цены':
             await message.answer('Первые 2 часа / дополнительный час:\nБудни до 19:00: 5000 / 2300 ₽\nБудни с 19:00 и выходные: 6000 / 2800 ₽\nПраздники: 6500 / 3000 ₽, либо тариф указанной администратором даты.\n4 платных гостя включены; сверх — 250 ₽/ч на человека. Дети до 6 включительно без доплаты, но в лимите 8.\nДлинная аренда по фактическим часам; оформляет администратор.');return
-        if text=='Услуги':
-            if await ready(message):
-                items=sorted_services(await db.pool.fetch('SELECT code,name,price FROM service_catalog WHERE active'))
-                await message.answer('\n'.join(f'{r["name"]}: {rub(r["price"])}' for r in items)+'\nЗаказать: Мои бронирования → Добавить услуги. Выполнение подтверждает администратор.')
+        if text in ('Услуги','Товары и услуги'):
+            if await ready(message):await shop().catalog(message,actor)
+            return
+        if text=='Корзина':
+            if await ready(message):await shop().cart(message,actor)
             return
         if not await ready(message):return
         if text=='Забронировать':
             if not BOOKING_ENABLED:await message.answer('Запись в боте пока настраивается. '+PHONE);return
             await dates(message);return
-        if text=='Мои бронирования':
-            rows=await db.pool.fetch('SELECT id,start_at,status FROM booking WHERE guest_id=$1 ORDER BY start_at DESC LIMIT 20',actor)
-            await message.answer('Ваши бронирования' if rows else 'У вас пока нет бронирований.',reply_markup=kb([[(r['start_at'].astimezone(TZ).strftime('%d.%m %H:%M')+' · '+STATUS[r['status']],f'order:{r["id"]}')] for r in rows]) if rows else None);return
+        if text=='Мои бронирования':await orders(message,actor);return
         if text.startswith('/'):await commands(message,actor,text);return
         state,data=await db.session(actor)
         if state=='guests':
@@ -154,7 +176,7 @@ async def message_handler(message:Message):
         if state=='children':
             value=int(text)
             if not 0<=value<=data['guests']:raise RuleError('Детей не больше общего числа гостей.')
-            data['children']=value;await db.set_session(actor,'name',data);await message.answer('Укажите Ваше имя для брони');return
+            data['children']=value;await shop().begin(message,actor,data);return
         if state=='name':
             if not 2<=len(text)<=100:raise RuleError('Имя от 2 до 100 символов.')
             data['name']=text;await ask_phone(message,actor,data);return
@@ -173,6 +195,10 @@ async def message_handler(message:Message):
         if state=='move':
             if len(text)<5:raise RuleError('Укажите желаемую дату и время.')
             await db.change(actor,data['booking'],'move',text);await db.set_session(actor,'',{});await message.answer('Запрос переноса отправлен. Исходное время остаётся занято до решения.');return
+        if state=='approve_move':
+            start=datetime.strptime(text,'%Y-%m-%d %H:%M').replace(tzinfo=TZ)
+            ident=await db.decide_change(actor,data['request'],True,start)
+            await db.set_session(actor,'',{});await show_order(message,ident,actor);return
         if state=='sendlink':
             ident=await db.send_link(actor,data['request'],text);await db.set_session(actor,'',{});await message.answer('Ссылка поставлена в очередь доставки гостю.');await show_order(message,ident,actor);return
         await message.answer('Выберите раздел меню или /start.',reply_markup=MENU)
@@ -237,7 +263,14 @@ async def callback_handler(call:CallbackQuery):
     try:
         if data=='rules':await call.answer();await chunks(message,RULES);return
         if not db:raise RuleError('Бронирование пока настраивается.')
+        if data.startswith('shop:'):
+            await shop().handle(call);return
         action,_,value=data.partition(':')
+        if action=='home':
+            await db.set_session(actor,'',{});await message.answer('Главное меню',reply_markup=MENU)
+            if await db.role(actor):await message.answer('Админ панель: /admin')
+            await call.answer();return
+        if action=='orders':await orders(message,actor);await call.answer();return
         if action=='order':await show_order(message,value,actor)
         elif action in ('phoneyes','phoneother'):
             state,d=await db.session(actor)
@@ -251,7 +284,8 @@ async def callback_handler(call:CallbackQuery):
             if not BOOKING_ENABLED:raise RuleError('Запись временно отключена.')
             ident=await db.reopen_for_payment(actor,value,RULES_HASH)
             await db.request_link(actor,ident)
-            await message.answer('Время свободно. Резерв возобновлён на 20 минут. Администратору отправлен запрос ссылки для оплаты; ссылка придёт сюда.')
+            b=await db.get(ident,actor)
+            await message.answer(f'Резерв действует до {b["release_at"].astimezone(TZ):%H:%M}. Запрос ссылки отправлен администратору; повторное нажатие срок не продлевает.')
             await show_order(message,ident,actor)
         elif action=='dates':await dates(message,max(0,int(value)))
         elif action=='date':
@@ -291,10 +325,8 @@ async def callback_handler(call:CallbackQuery):
             else:
                 await db.set_session(actor,'pay',{'booking':value});await message.answer('После фактической доплаты введите перечисленную сумму в рублях: всю или часть остатка. Для выхода /cancel.')
         elif action=='services':
-            b=await db.get(value,actor)
-            if b['status'] not in ('held','payment_review','review_overdue','confirmed','in_progress'):raise RuleError('Заказ закрыт. Свяжитесь с администратором.')
-            await db.set_session(actor,'cart',{'booking':value,'cart':{},'token':uid()[:12]})
-            await show_cart(message,actor)
+            token=await shop().store.start(actor,{},value)
+            await shop().catalog(message,actor,token)
         elif action in ('cplus','cminus'):
             ident,code,token=value.split(':')
             await db.cart_adjust(actor,ident,code,token,1 if action=='cplus' else -1)
@@ -313,7 +345,13 @@ async def callback_handler(call:CallbackQuery):
         elif action=='move':await db.get(value,actor);await db.set_session(actor,'move',{'booking':value});await message.answer('Укажите желаемую дату и время. Перенос после одобрения.')
         elif action in ('pc','pr'):await show_order(message,await db.decide_payment(actor,value,action=='pc'),actor)
         elif action in ('sa','sr'):await show_order(message,await db.decide_service(actor,value,action=='sa'),actor)
-        elif action in ('ca','cr'):await show_order(message,await db.decide_change(actor,value,action=='ca'),actor)
+        elif action in ('ca','cr'):
+            r=await db.pool.fetchrow('SELECT * FROM change_request WHERE id=$1',value)
+            async with db.write() as c:await db.staff(actor,c)
+            if action=='ca' and r and r['kind']=='move':
+                await db.set_session(actor,'approve_move',{'request':value});await message.answer('Введите новое начало: ГГГГ-ММ-ДД ЧЧ:ММ. Время и уборка будут проверены перед переносом. Для выхода /cancel.')
+            else:await show_order(message,await db.decide_change(actor,value,action=='ca'),actor)
+        elif action in ('da','dr'):await show_order(message,await shop().store.decide_duration(actor,value,action=='da'),actor)
         elif action=='noshow':await db.change(actor,value,'no_show');await message.answer('Отметка передана администратору. Деньги автоматически не изменены.')
         elif action=='sendlink':
             async with db.write() as c:await db.staff(actor,c)
@@ -333,7 +371,7 @@ async def admin_action(message,actor,action):
     async with db.write() as c:await db.staff(actor,c)
     if action in ('list','pending'):
         if action=='list':rows=await db.pool.fetch('SELECT id,start_at,status FROM booking WHERE cleanup_end>=now() ORDER BY start_at LIMIT 30')
-        else:rows=await db.pool.fetch("SELECT DISTINCT b.id,b.start_at,b.status FROM booking b WHERE b.status IN ('held','payment_review','review_overdue') OR EXISTS(SELECT 1 FROM payment_claim p WHERE p.booking_id=b.id AND p.status='pending') OR EXISTS(SELECT 1 FROM booking_service s WHERE s.booking_id=b.id AND s.status='requested') OR EXISTS(SELECT 1 FROM change_request r WHERE r.booking_id=b.id AND r.status='pending') OR EXISTS(SELECT 1 FROM payment_link_request l WHERE l.booking_id=b.id AND l.status='pending') ORDER BY start_at LIMIT 30")
+        else:rows=await db.pool.fetch("SELECT DISTINCT b.id,b.start_at,b.status FROM booking b WHERE b.status IN ('held','payment_review','review_overdue') OR EXISTS(SELECT 1 FROM payment_claim p WHERE p.booking_id=b.id AND p.status='pending') OR EXISTS(SELECT 1 FROM booking_service s WHERE s.booking_id=b.id AND s.status='requested') OR EXISTS(SELECT 1 FROM change_request r WHERE r.booking_id=b.id AND r.status='pending') OR EXISTS(SELECT 1 FROM payment_link_request l WHERE l.booking_id=b.id AND l.status='pending') OR EXISTS(SELECT 1 FROM duration_request d WHERE d.booking_id=b.id AND d.status='pending') ORDER BY start_at LIMIT 30")
         await message.answer('Брони' if rows else 'Нет заявок.',reply_markup=kb([[(r['start_at'].astimezone(TZ).strftime('%d.%m %H:%M')+' '+STATUS[r['status']],f'order:{r["id"]}')] for r in rows]) if rows else None)
     elif action=='manual':await message.answer('Ручная бронь после явного согласия гостя с правилами:\n/manual ГГГГ-ММ-ДД ЧЧ:ММ ЧАСЫ TELEGRAM_ID ВСЕГО ДЕТЕЙ ТЕЛЕФОН СОГЛАСИЕ ИМЯ\nСначала гость открывает бота. Резерв 20 минут; затем заявление оплаты и проверка.')
     elif action=='block':
@@ -343,10 +381,10 @@ async def admin_action(message,actor,action):
         rows=await db.pool.fetch('SELECT * FROM holiday WHERE day>=CURRENT_DATE ORDER BY day LIMIT 60')
         await chunks(message,'Задать: /holiday ГГГГ-ММ-ДД ЦЕНА_2Ч ДОП_ЧАС НАЗВАНИЕ\nСнять: /unholiday ГГГГ-ММ-ДД\nНовогодние цены задаются таким же способом.\n'+'\n'.join(f'{r["day"]}: {rub(r["base"])}/{rub(r["extra"])} {r["label"]}' for r in rows))
     elif action=='catalog':
-        rows=await db.pool.fetch('SELECT * FROM service_catalog ORDER BY code')
+        rows=sorted_services(await db.pool.fetch('SELECT * FROM service_catalog'))
         await message.answer('\n'.join(f'{r["code"]}: {r["name"]} {rub(r["price"])}' for r in rows)+'\nВладелец: /serviceprice КОД ЦЕНА. Подтверждайте доступные услуги.')
     elif action=='roles':
-        rows=await db.pool.fetch('SELECT * FROM staff');await message.answer('\n'.join(f'{r["telegram_id"]}: {r["role"]}' for r in rows)+'\nВладелец: /addadmin ID или /deladmin ID. Администратор сначала открывает /start.')
+        rows=await db.pool.fetch('SELECT * FROM staff');await message.answer('\n'.join(f'{r["telegram_id"]}: '+{'owner':'Владелец','admin':'Администратор'}[r['role']] for r in rows)+'\nВладелец: /addadmin ID или /deladmin ID. Администратор сначала открывает /start.')
     elif action=='refund':
         rows=await db.pool.fetch('SELECT * FROM refund ORDER BY created_at DESC LIMIT 20')
         await chunks(message,'PayKeeper отложен. Автоматической отправки возвратов нет. Заявки для ручного рассмотрения:\n'+'\n'.join(f'{r["id"]}: {rub(r["amount"])} · {r["reason"]} · заказ {r["booking_id"]}' for r in rows))

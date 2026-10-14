@@ -83,3 +83,17 @@ CREATE TABLE IF NOT EXISTS outbox (
  due_at timestamptz NOT NULL DEFAULT now(), sent_at timestamptz, attempts integer NOT NULL DEFAULT 0,
  locked_until timestamptz, last_error text, dedupe_key text UNIQUE NOT NULL
 );
+
+ALTER TABLE booking ADD COLUMN IF NOT EXISTS duration_approved boolean NOT NULL DEFAULT true;
+CREATE TABLE IF NOT EXISTS checkout_draft (
+ telegram_id bigint PRIMARY KEY, token text NOT NULL, data jsonb NOT NULL,
+ updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS duration_request (
+ id text PRIMARY KEY, booking_id text NOT NULL REFERENCES booking(id),
+ target_hours integer NOT NULL CHECK(target_hours BETWEEN 3 AND 5),
+ initial boolean NOT NULL DEFAULT false, status text NOT NULL DEFAULT 'pending'
+ CHECK(status IN ('pending','approved','rejected')), actor bigint, created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS one_pending_duration ON duration_request(booking_id) WHERE status='pending';
+ALTER TABLE duration_request ADD COLUMN IF NOT EXISTS quoted_rent bigint NOT NULL DEFAULT 0;

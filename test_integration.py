@@ -143,6 +143,97 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         await self.db.finish_cart(2,ident,'token',False)
         self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM booking_service'),0)
 
+    async def checkout_cart(self,actor=2,hours=2):
+        from checkout_store import CheckoutStore
+        cs=CheckoutStore(self.db);d=self.data(actor);d['hours']=hours
+        token=await cs.start(actor,d)
+        await cs.action(actor,token,'rental')
+        await cs.quote(actor,token)
+        return cs,token
+
+    async def test_checkout_product_selection_and_atomic_creation(self):
+        cs,token=await self.checkout_cart()
+        await cs.action(2,token,'product','towel');_,d=await cs.read(2,token);nonce=d['item']['nonce']
+        await asyncio.gather(cs.action(2,token,'plus',nonce=nonce),cs.action(2,token,'plus',nonce=nonce))
+        _,d=await cs.read(2,token);self.assertEqual(d['item']['qty'],3);self.assertEqual(d['cart'],{})
+        await cs.action(2,token,'add',nonce=nonce)
+        with self.assertRaises(RuleError):await cs.action(2,token,'add',nonce=nonce)
+        await cs.quote(2,token);await cs.action(2,token,'consent')
+        ids=await asyncio.gather(cs.checkout(2,token,'rules'),cs.checkout(2,token,'rules'))
+        self.assertEqual(ids[0],ids[1]);self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM booking'),1)
+        self.assertEqual(await self.pool.fetchval('SELECT quantity FROM booking_service'),3)
+        self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM payment_link_request'),1)
+
+    async def test_checkout_consent_and_prices(self):
+        cs,token=await self.checkout_cart()
+        with self.assertRaises(RuleError):await cs.checkout(2,token,'rules')
+        await cs.action(2,token,'product','towel');_,d=await cs.read(2,token)
+        await cs.action(2,token,'add',nonce=d['item']['nonce']);await cs.quote(2,token);await cs.action(2,token,'consent')
+        await self.pool.execute("UPDATE service_catalog SET price=20000 WHERE code='towel'")
+        with self.assertRaises(RuleError):await cs.checkout(2,token,'rules')
+        _,d=await cs.quote(2,token);self.assertFalse(d['consent']);self.assertEqual(d['cart']['towel']['price'],20000)
+        self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM booking'),0)
+
+    async def test_long_checkout_requires_administrator_and_blocks_cleanup(self):
+        cs,token=await self.checkout_cart(hours=3);await cs.action(2,token,'consent')
+        ident=await cs.checkout(2,token,'rules');b=await self.db.get(ident,2)
+        self.assertFalse(b['duration_approved'])
+        rid=await self.pool.fetchval('SELECT id FROM payment_link_request')
+        with self.assertRaises(RuleError):await self.db.send_link(1,rid,'https://example.com/pay')
+        claim=await self.db.claim(2,ident,200000)
+        with self.assertRaises(RuleError):await self.db.decide_payment(1,claim,True)
+        req=await self.pool.fetchval('SELECT id FROM duration_request')
+        with self.assertRaises(RuleError):await cs.decide_duration(3,req,True)
+        await cs.decide_duration(1,req,True);await self.db.decide_payment(1,claim,True)
+        other=self.data(3);other['start']=(self.start+timedelta(hours=3)).isoformat();other['quote']=price(self.start+timedelta(hours=3),2,4,0)[0]
+        with self.assertRaises(RuleError):await self.db.hold(3,other,'rules','conflict-cleaning')
+
+    async def test_checkout_owned_and_stale_cards(self):
+        cs,token=await self.checkout_cart()
+        with self.assertRaises(RuleError):await cs.action(3,token,'rental')
+        await cs.action(2,token,'product','towel');_,d=await cs.read(2,token);nonce=d['item']['nonce']
+        await cs.action(2,token,'product','towel')
+        with self.assertRaises(RuleError):await cs.action(2,token,'plus',nonce=nonce)
+        self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM booking'),0)
+
+    async def test_extra_hour_conflict_keeps_original_booking(self):
+        ident=await self.create();cl=await self.db.claim(2,ident,200000);await self.db.decide_payment(1,cl,True)
+        from checkout_store import CheckoutStore
+        cs=CheckoutStore(self.db);token=await cs.start(2,{},ident)
+        await cs.action(2,token,'hourplus');await cs.quote(2,token);await cs.action(2,token,'consent')
+        await cs.checkout(2,token,'rules');req=await self.pool.fetchval('SELECT id FROM duration_request')
+        other=self.data(3);other['start']=(self.start+timedelta(hours=3)).isoformat();other['quote']=price(self.start+timedelta(hours=3),2,4,0)[0]
+        await self.db.hold(3,other,'rules','other')
+        with self.assertRaises(RuleError):await cs.decide_duration(1,req,True)
+        self.assertEqual((await self.db.get(ident,2))['end_at'],self.start+timedelta(hours=2))
+        self.assertEqual(await self.pool.fetchval('SELECT status FROM duration_request'),'pending')
+
+    async def test_extra_hour_approval_preserves_original_rent(self):
+        ident=await self.create();cl=await self.db.claim(2,ident,200000);await self.db.decide_payment(1,cl,True)
+        from checkout_store import CheckoutStore
+        cs=CheckoutStore(self.db);token=await cs.start(2,{},ident)
+        old=(await self.db.get(ident,2))['rent']
+        await cs.action(2,token,'hourplus');_,d=await cs.quote(2,token)
+        target=d['quote'];await cs.action(2,token,'consent');await cs.checkout(2,token,'rules')
+        req=await self.pool.fetchval('SELECT id FROM duration_request');await cs.decide_duration(1,req,True)
+        b=await self.db.get(ident,2);self.assertEqual(b['rent'],target);self.assertGreater(b['rent'],old)
+        self.assertEqual(b['cleanup_end'],self.start+timedelta(hours=4))
+
+    async def test_new_payment_amount_not_silently_ignored(self):
+        ident=await self.create();await self.db.claim(2,ident,200000)
+        with self.assertRaises(RuleError):await self.db.claim(2,ident,150000)
+        self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM payment_claim'),1)
+
+    async def test_long_rejection_closes_pending_services_and_links(self):
+        cs,token=await self.checkout_cart(hours=3)
+        await cs.action(2,token,'product','towel');_,d=await cs.read(2,token)
+        await cs.action(2,token,'add',nonce=d['item']['nonce']);await cs.quote(2,token);await cs.action(2,token,'consent')
+        ident=await cs.checkout(2,token,'rules');req=await self.pool.fetchval('SELECT id FROM duration_request')
+        await cs.decide_duration(1,req,False)
+        self.assertEqual((await self.db.get(ident,2))['status'],'rejected')
+        self.assertEqual(await self.pool.fetchval('SELECT status FROM booking_service'),'rejected')
+        self.assertEqual(await self.pool.fetchval('SELECT status FROM payment_link_request'),'closed')
+
     async def test_backup_restore_in_empty_schema(self):
         import gzip,json,tempfile
         from backup import snapshot,TABLES

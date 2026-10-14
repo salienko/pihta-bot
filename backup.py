@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import asyncpg
 
-TABLES=('bath_resource','staff','settings','holiday','service_catalog','booking','calendar_block','payment_claim','payment_link_request','receipt','booking_service','change_request','refund','audit','ui_session','guest_contact','outbox')
+TABLES=('bath_resource','staff','settings','holiday','service_catalog','booking','calendar_block','payment_claim','payment_link_request','receipt','booking_service','change_request','refund','audit','ui_session','guest_contact','checkout_draft','duration_request','outbox')
 
 async def snapshot(url,folder='/app/data/backups',schema=None):
     path=Path(folder);path.mkdir(parents=True,exist_ok=True)

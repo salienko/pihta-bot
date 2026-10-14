@@ -149,28 +149,32 @@ class Store:
             raise RuleError('Это время уже занято, включая уборку. Выберите другой сеанс.')
 
     async def hold(self,actor,data,rules_hash,operation,manual=False):
+        async with self.write() as c:
+            return await self._hold(c,actor,data,rules_hash,operation,manual)
+
+    async def _hold(self,c,actor,data,rules_hash,operation,manual=False,requested_long=False):
         from datetime import datetime
         start=datetime.fromisoformat(data['start'])
-        async with self.write() as c:
-            clock=await c.fetchval('SELECT clock_timestamp()')
-            clock=clock.astimezone(start.tzinfo)
-            if manual:await self.staff(actor,c)
-            old=await c.fetchval('SELECT id FROM booking WHERE operation_key=$1',operation)
-            if old:return old
-            end,cleanup=window(start,data.get('hours',2),clock,manual)
-            rent,lines=await self.quote(start,data.get('hours',2),data['guests'],data['children'],c)
-            if not manual and data.get('quote')!=rent:
-                raise RuleError('Тариф изменился. Проверьте новый расчёт и подтвердите оформление заново.')
-            if not data.get('consent'):
-                raise RuleError('Сначала ознакомьтесь с правилами и отметьте согласие.')
-            phone=normalize_phone(data['phone'])
-            await self.available(c,start,cleanup)
-            ident=uid()
-            await c.execute('''INSERT INTO booking(id,operation_key,guest_id,name,phone,start_at,end_at,cleanup_end,status,guests,children,rent,price_lines,rules_hash,consent_at,release_at)
-                VALUES($1,$2,$3,$4,$5,$6,$7,$8,'held',$9,$10,$11,$12::jsonb,$13,$14,$15)''',ident,operation,data.get('guest_id',actor),data['name'],phone,start,end,cleanup,data['guests'],data['children'],rent,json.dumps(lines),rules_hash,clock,clock+timedelta(minutes=20))
-            await self.audit(c,actor,'create_hold',ident,{'manual':manual,'rent':rent})
-            await self.notify_staff(c,f'Новый резерв {ident}\n{start:%d.%m %H:%M}, {data.get("hours",2)} ч.\n{data["name"]}, {data["phone"]}\nПроверка: /order {ident}',f'hold:{ident}')
-            return ident
+        clock=await c.fetchval('SELECT clock_timestamp()')
+        clock=clock.astimezone(start.tzinfo)
+        if manual:await self.staff(actor,c)
+        old=await c.fetchval('SELECT id FROM booking WHERE operation_key=$1',operation)
+        if old:return old
+        if requested_long:window(start,2,clock)
+        end,cleanup=window(start,data.get('hours',2),clock,manual or requested_long)
+        rent,lines=await self.quote(start,data.get('hours',2),data['guests'],data['children'],c)
+        if not manual and data.get('quote')!=rent:
+            raise RuleError('Тариф изменился. Проверьте новый расчёт и подтвердите оформление заново.')
+        if not data.get('consent'):
+            raise RuleError('Сначала ознакомьтесь с правилами и отметьте согласие.')
+        phone=normalize_phone(data['phone'])
+        await self.available(c,start,cleanup)
+        ident=uid()
+        await c.execute('''INSERT INTO booking(id,operation_key,guest_id,name,phone,start_at,end_at,cleanup_end,status,guests,children,rent,price_lines,rules_hash,consent_at,release_at)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,'held',$9,$10,$11,$12::jsonb,$13,$14,$15)''',ident,operation,data.get('guest_id',actor),data['name'],phone,start,end,cleanup,data['guests'],data['children'],rent,json.dumps(lines),rules_hash,clock,clock+timedelta(minutes=20))
+        await self.audit(c,actor,'create_hold',ident,{'manual':manual,'rent':rent})
+        await self.notify_staff(c,f'Новый резерв {ident}\n{start:%d.%m %H:%M}, {data.get("hours",2)} ч.\n{data["name"]}, {data["phone"]}\nПроверка: /order {ident}',f'hold:{ident}')
+        return ident
 
     async def totals(self,ident,c=None):
         c=c or self.pool
@@ -186,8 +190,10 @@ class Store:
             if actor!=b['guest_id']:raise RuleError('Заявить оплату может только гость этого заказа.')
             clock=await c.fetchval('SELECT clock_timestamp()')
             claim_allowed(b['status'],b['release_at'],clock)
-            pending=await c.fetchval("SELECT id FROM payment_claim WHERE booking_id=$1 AND status='pending'",ident)
-            if pending:return pending
+            pending=await c.fetchrow("SELECT id,amount FROM payment_claim WHERE booking_id=$1 AND status='pending'",ident)
+            if pending:
+                if pending['amount']==amount:return pending['id']
+                raise RuleError('Предыдущая оплата ещё на проверке. Новая сумма не зарегистрирована: свяжитесь с администратором для сверки.')
             total,paid,left=await self.totals(ident,c)
             if not 0<amount<=left:raise RuleError('Сумма должна быть положительной и не больше остатка.')
             claim_id=uid()
@@ -209,6 +215,7 @@ class Store:
                 raise RuleError('Бронь закрыта. Поздний платёж разберите вручную без восстановления времени.')
             await c.execute('UPDATE payment_claim SET status=$2 WHERE id=$1',claim_id,'confirmed' if approve else 'rejected')
             if approve:
+                if not b['duration_approved']:raise RuleError('Сначала подтвердите длительность аренды.')
                 await c.execute('INSERT INTO receipt VALUES($1,$2,$3,$4,$5,now()) ON CONFLICT(claim_id) DO NOTHING',uid(),b['id'],claim_id,cl['amount'],actor)
                 total,paid,left=await self.totals(b['id'],c)
                 if paid>=200000 and b['status'] in ('held','payment_review','review_overdue'):
@@ -225,19 +232,24 @@ class Store:
 
     async def request_link(self,actor,ident):
         async with self.write() as c:
-            b=await self.get(ident,actor,c)
-            if actor!=b['guest_id']:raise RuleError('Ссылку запрашивает гость этого заказа.')
-            clock=await c.fetchval('SELECT clock_timestamp()')
-            claim_allowed(b['status'],b['release_at'],clock)
-            _,_,left=await self.totals(ident,c)
-            if not left:raise RuleError('Заказ уже оплачен.')
-            old=await c.fetchval("SELECT id FROM payment_link_request WHERE booking_id=$1 AND status='pending'",ident)
-            if old:return old
-            rid=uid()
-            await c.execute('INSERT INTO payment_link_request(id,booking_id) VALUES($1,$2)',rid,ident)
-            await self.notify_staff(c,f'Гость запросил ссылку для оплаты. Остаток {rub(left)}.\n/order {ident}\nОтправка: /paylink {rid} https://ссылка\nОжидание ссылки не продлевает резерв.',f'paylink-request:{rid}')
-            await self.audit(c,actor,'request_payment_link',rid)
-            return rid
+            return await self._request_link(c,actor,ident)
+
+    async def _request_link(self,c,actor,ident):
+        b=await self.get(ident,actor,c)
+        if actor!=b['guest_id']:raise RuleError('Ссылку запрашивает гость этого заказа.')
+        clock=await c.fetchval('SELECT clock_timestamp()')
+        claim_allowed(b['status'],b['release_at'],clock)
+        _,_,left=await self.totals(ident,c)
+        pending_services=await c.fetchval("SELECT EXISTS(SELECT 1 FROM booking_service WHERE booking_id=$1 AND status='requested')",ident)
+        pending_duration=await c.fetchval("SELECT EXISTS(SELECT 1 FROM duration_request WHERE booking_id=$1 AND status='pending')",ident)
+        if not left and not pending_services and not pending_duration:raise RuleError('Заказ уже оплачен.')
+        old=await c.fetchval("SELECT id FROM payment_link_request WHERE booking_id=$1 AND status='pending'",ident)
+        if old:return old
+        rid=uid()
+        await c.execute('INSERT INTO payment_link_request(id,booking_id) VALUES($1,$2)',rid,ident)
+        await self.notify_staff(c,f'Гость запросил ссылку для оплаты. Остаток {rub(left)}.\n/order {ident}\nОтправка: /paylink {rid} https://ссылка\nОжидание ссылки не продлевает резерв.',f'paylink-request:{rid}')
+        await self.audit(c,actor,'request_payment_link',rid)
+        return rid
 
     async def send_link(self,actor,rid,url):
         from urllib.parse import urlsplit
@@ -250,6 +262,7 @@ class Store:
             if not r:raise RuleError('Запрос ссылки не найден.')
             if r['status']!='pending':raise RuleError('Этот запрос уже обработан.')
             b=await self.get(r['booking_id'],actor,c)
+            if not b['duration_approved']:raise RuleError('Сначала подтвердите длительность аренды.')
             clock=await c.fetchval('SELECT clock_timestamp()')
             claim_allowed(b['status'],b['release_at'],clock)
             _,_,left=await self.totals(b['id'],c)
@@ -298,7 +311,7 @@ class Store:
         async with self.write() as c:
             b=await self.get(ident,actor,c)
             if kind=='no_show':await self.staff(actor,c)
-            if b['status'] not in ('confirmed','in_progress','payment_review','review_overdue'):
+            if b['status'] not in ('held','confirmed','in_progress','payment_review','review_overdue'):
                 raise RuleError('Для этой брони запрос недоступен.')
             old=await c.fetchval("SELECT id FROM change_request WHERE booking_id=$1 AND status='pending'",ident)
             if old:return old
@@ -329,6 +342,8 @@ class Store:
                 text=f'Перенос одобрен: {new_start:%d.%m.%Y %H:%M}. Финансовую разницу уточните у администратора.'
             elif approve and r['kind']=='cancel':
                 await c.execute("UPDATE booking SET status='cancelled',revision=revision+1 WHERE id=$1",b['id'])
+                await c.execute("UPDATE duration_request SET status='rejected' WHERE booking_id=$1 AND status='pending'",b['id'])
+                await c.execute("UPDATE payment_link_request SET status='closed' WHERE booking_id=$1 AND status='pending'",b['id'])
                 await c.execute("UPDATE booking_service SET status='rejected',actor=$2 WHERE booking_id=$1 AND status='requested'",b['id'],actor)
                 _,paid,_=await self.totals(b['id'],c)
                 late=(b['start_at']-r['created_at']).total_seconds()<10800
@@ -354,6 +369,9 @@ class Store:
             await c.execute("UPDATE booking SET status='rejected',revision=revision+1 WHERE id=$1",ident)
             await c.execute("UPDATE payment_claim SET status='rejected' WHERE booking_id=$1 AND status='pending'",ident)
             await self.queue(c,b['guest_id'],'Администратор отклонил бронь. Если деньги были отправлены, свяжитесь с ним для сверки и возврата.',f'reject:{ident}')
+            await c.execute("UPDATE duration_request SET status='rejected' WHERE booking_id=$1 AND status='pending'",ident)
+            await c.execute("UPDATE payment_link_request SET status='closed' WHERE booking_id=$1 AND status='pending'",ident)
+            await c.execute("UPDATE booking_service SET status='rejected' WHERE booking_id=$1 AND status='requested'",ident)
             await self.audit(c,actor,'reject_booking',ident)
 
     async def maintenance(self):
@@ -361,6 +379,9 @@ class Store:
             clock=await c.fetchval('SELECT clock_timestamp()')
             for b in await c.fetch("UPDATE booking SET status='expired',revision=revision+1 WHERE status='held' AND release_at<=$1 RETURNING *",clock):
                 await self.queue(c,b['guest_id'],'Резерв истёк через 20 минут без заявления оплаты. Нажмите «Заплатить сейчас»: проверим, свободно ли ещё это время, и запросим ссылку у администратора.',f'expired:{b["id"]}:{b["revision"]}',b,'expired')
+                await c.execute("UPDATE duration_request SET status='rejected' WHERE booking_id=$1 AND status='pending'",b['id'])
+                await c.execute("UPDATE payment_link_request SET status='closed' WHERE booking_id=$1 AND status='pending'",b['id'])
+                await c.execute("UPDATE booking_service SET status='rejected' WHERE booking_id=$1 AND status='requested'",b['id'])
                 await self.audit(c,0,'expire',b['id'])
             for b in await c.fetch("UPDATE booking SET status='review_overdue' WHERE status='payment_review' AND verification_due<=$1 RETURNING *",clock):
                 await self.notify_staff(c,f'Просрочена проверка оплаты. Время остаётся занято.\n/order {b["id"]}',f'overdue:{b["id"]}')
