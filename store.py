@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
 import asyncpg
-from domain import ACTIVE, SERVICES, RuleError, now, price, window, claim_allowed, rub
+from domain import ACTIVE, SERVICES, RuleError, now, price, window, claim_allowed, rub, normalize_phone
 
 def uid():
     return uuid.uuid4().hex
@@ -57,6 +57,67 @@ class Store:
     async def set_session(self,actor,state,data):
         await self.pool.execute('INSERT INTO ui_session VALUES($1,$2,$3::jsonb,now()) ON CONFLICT(telegram_id) DO UPDATE SET state=$2,data=$3::jsonb,updated_at=now()',actor,state,json.dumps(data))
 
+    async def saved_phone(self,actor):
+        value=await self.pool.fetchval('SELECT phone FROM guest_contact WHERE telegram_id=$1',actor)
+        if not value:value=await self.pool.fetchval('SELECT phone FROM booking WHERE guest_id=$1 ORDER BY created_at DESC LIMIT 1',actor)
+        if value:
+            try:return normalize_phone(value)
+            except RuleError:pass
+        return None
+
+    async def save_phone(self,actor,phone):
+        await self.pool.execute('INSERT INTO guest_contact VALUES($1,$2,now()) ON CONFLICT(telegram_id) DO UPDATE SET phone=$2,updated_at=now()',actor,normalize_phone(phone))
+
+    async def reopen_for_payment(self,actor,ident,rules_hash):
+        async with self.write() as c:
+            b=await self.get(ident,actor,c)
+            if b['guest_id']!=actor:raise RuleError('Оплатить может только гость этой брони.')
+            clock=await c.fetchval('SELECT clock_timestamp()')
+            if b['status']=='held' and b['release_at']>clock:return ident
+            if b['status'] not in ('expired','held'):raise RuleError('Откройте актуальную карточку брони.')
+            if b['rules_hash']!=rules_hash:raise RuleError('Правила обновились. Оформите бронь заново и ознакомьтесь с новой редакцией.')
+            start=b['start_at'].astimezone(now().tzinfo)
+            hours=int((b['end_at']-b['start_at']).total_seconds()/3600)
+            window(start,hours,clock.astimezone(start.tzinfo),True)
+            await self.available(c,start,b['cleanup_end'],ident)
+            _,paid,_=await self.totals(ident,c)
+            if paid:raise RuleError('Есть поступления. Свяжитесь с администратором для сверки.')
+            await c.execute("UPDATE booking SET status='held',release_at=$2,claim_at=NULL,verification_due=NULL,revision=revision+1 WHERE id=$1",ident,clock+timedelta(minutes=20))
+            await c.execute("UPDATE payment_link_request SET status='closed' WHERE booking_id=$1 AND status='pending'",ident)
+            await self.audit(c,actor,'reopen_for_payment',ident)
+            return ident
+
+    async def service_basket(self,actor,ident,selection,operation):
+        async with self.write() as c:
+            b=await self.get(ident,actor,c)
+            if b['status'] not in ('held','payment_review','review_overdue','confirmed','in_progress'):raise RuleError('Заказ закрыт. Свяжитесь с администратором.')
+            if not selection:raise RuleError('Выберите хотя бы одну услугу.')
+            existing=await c.fetchval("SELECT EXISTS(SELECT 1 FROM booking_service WHERE operation_key LIKE $1)",operation+':%')
+            if existing:return
+            lines=[]
+            for code,qty in selection.items():
+                if not isinstance(qty,int) or not 1<=qty<=100:raise RuleError('Количество каждой услуги от 1 до 100.')
+                item=await c.fetchrow('SELECT * FROM service_catalog WHERE code=$1 AND active',code)
+                if not item:raise RuleError('Одна из услуг больше недоступна. Проверьте корзину.')
+                await c.execute('INSERT INTO booking_service(id,booking_id,code,name,quantity,price,operation_key) VALUES($1,$2,$3,$4,$5,$6,$7)',uid(),ident,code,item['name'],qty,item['price'],operation+':'+code)
+                lines.append(f'{item["name"]} × {qty}')
+            await self.notify_staff(c,'Корзина услуг:\n'+'\n'.join(lines)+f'\n/order {ident}',f'basket:{operation}')
+            await self.audit(c,actor,'request_service_basket',ident,selection)
+
+    async def cart_adjust(self,actor,ident,code,token,delta):
+        async with self.write() as c:
+            await self.get(ident,actor,c)
+            session=await c.fetchrow('SELECT state,data FROM ui_session WHERE telegram_id=$1 FOR UPDATE',actor)
+            d=json.loads(session['data']) if session else {}
+            if not session or session['state']!='cart' or d.get('booking')!=ident or d.get('token')!=token:
+                raise RuleError('Эта корзина устарела. Откройте услуги заново.')
+            if not await c.fetchval('SELECT active FROM service_catalog WHERE code=$1',code):raise RuleError('Услуга недоступна.')
+            cart=d.setdefault('cart',{});quantity=cart.get(code,0)+delta
+            if not 0<=quantity<=100:raise RuleError('Количество от 0 до 100.')
+            if quantity:cart[code]=quantity
+            else:cart.pop(code,None)
+            await c.execute('UPDATE ui_session SET data=$2::jsonb,updated_at=now() WHERE telegram_id=$1',actor,json.dumps(d))
+
     async def get(self,ident,actor,c=None):
         c=c or self.pool
         r=await c.fetchrow('SELECT * FROM booking WHERE id=$1',ident)
@@ -89,10 +150,11 @@ class Store:
                 raise RuleError('Тариф изменился. Проверьте новый расчёт и подтвердите оформление заново.')
             if not data.get('consent'):
                 raise RuleError('Сначала ознакомьтесь с правилами и отметьте согласие.')
+            phone=normalize_phone(data['phone'])
             await self.available(c,start,cleanup)
             ident=uid()
             await c.execute('''INSERT INTO booking(id,operation_key,guest_id,name,phone,start_at,end_at,cleanup_end,status,guests,children,rent,price_lines,rules_hash,consent_at,release_at)
-                VALUES($1,$2,$3,$4,$5,$6,$7,$8,'held',$9,$10,$11,$12::jsonb,$13,$14,$15)''',ident,operation,data.get('guest_id',actor),data['name'],data['phone'],start,end,cleanup,data['guests'],data['children'],rent,json.dumps(lines),rules_hash,clock,clock+timedelta(minutes=20))
+                VALUES($1,$2,$3,$4,$5,$6,$7,$8,'held',$9,$10,$11,$12::jsonb,$13,$14,$15)''',ident,operation,data.get('guest_id',actor),data['name'],phone,start,end,cleanup,data['guests'],data['children'],rent,json.dumps(lines),rules_hash,clock,clock+timedelta(minutes=20))
             await self.audit(c,actor,'create_hold',ident,{'manual':manual,'rent':rent})
             await self.notify_staff(c,f'Новый резерв {ident}\n{start:%d.%m %H:%M}, {data.get("hours",2)} ч.\n{data["name"]}, {data["phone"]}\nПроверка: /order {ident}',f'hold:{ident}')
             return ident
@@ -285,7 +347,7 @@ class Store:
         async with self.write() as c:
             clock=await c.fetchval('SELECT clock_timestamp()')
             for b in await c.fetch("UPDATE booking SET status='expired',revision=revision+1 WHERE status='held' AND release_at<=$1 RETURNING *",clock):
-                await self.queue(c,b['guest_id'],'Резерв истёк через 20 минут без заявления оплаты. Для позднего платежа свяжитесь с администратором.',f'expired:{b["id"]}')
+                await self.queue(c,b['guest_id'],'Резерв истёк через 20 минут без заявления оплаты. Нажмите «Заплатить сейчас»: проверим, свободно ли ещё это время, и запросим ссылку у администратора.',f'expired:{b["id"]}:{b["revision"]}',b,'expired')
                 await self.audit(c,0,'expire',b['id'])
             for b in await c.fetch("UPDATE booking SET status='review_overdue' WHERE status='payment_review' AND verification_due<=$1 RETURNING *",clock):
                 await self.notify_staff(c,f'Просрочена проверка оплаты. Время остаётся занято.\n/order {b["id"]}',f'overdue:{b["id"]}')
@@ -307,8 +369,10 @@ class Store:
     async def outgoing_text(self,row):
         if not row['kind']:return row['text']
         b=await self.pool.fetchrow('SELECT * FROM booking WHERE id=$1',row['booking_id'])
+        if row['kind']=='expired':
+            return row['text'] if b and b['status']=='expired' and b['revision']==row['revision'] else None
         if row['kind']=='payment_link':
-            if not b or b['status'] not in ('held','payment_review','review_overdue','confirmed','in_progress') or (b['status']=='held' and b['release_at']<=now()):
+            if not b or b['revision']!=row['revision'] or b['status'] not in ('held','payment_review','review_overdue','confirmed','in_progress') or (b['status']=='held' and b['release_at']<=now()):
                 return None
             return row['text']
         if not b or b['revision']!=row['revision'] or b['status'] not in ('confirmed','in_progress'):

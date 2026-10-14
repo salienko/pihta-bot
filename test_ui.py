@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock
 from aiogram.types import Message, Chat, User, CallbackQuery
 from datetime import datetime
 import bot
+from domain import SERVICES
 
 class UITests(unittest.IsolatedAsyncioTestCase):
     def message(self,text,user=2):
@@ -41,5 +42,31 @@ class UITests(unittest.IsolatedAsyncioTestCase):
         for action in ['order','pay','services','sendlink','cancelok','rejectask']:
             markup=bot.kb([[('Test',action+':'+('a'*32))]])
             self.assertLessEqual(len(markup.inline_keyboard[0][0].callback_data.encode()),64)
+
+    async def test_own_contact_normalized_before_confirmation(self):
+        from aiogram.types import Contact
+        bot.db=AsyncMock();bot.db.session.return_value=('phone',{'operation':'x'})
+        message=self.message('')
+        object.__setattr__(message,'contact',Contact(phone_number='89812440050',first_name='Test',user_id=2))
+        await bot.message_handler(message)
+        bot.db.set_session.assert_awaited_once_with(2,'phone_confirm',{'operation':'x','phone':'+79812440050'})
+        markup=message.answer.call_args.kwargs['reply_markup']
+        self.assertEqual([b.text for b in markup.inline_keyboard[0]],['Да','Использовать другой номер'])
+
+    async def test_foreign_contact_not_accepted(self):
+        from aiogram.types import Contact
+        bot.db=AsyncMock();bot.db.session.return_value=('phone',{'operation':'x'})
+        message=self.message('');object.__setattr__(message,'contact',Contact(phone_number='89812440050',first_name='Other',user_id=3))
+        await bot.message_handler(message);bot.db.set_session.assert_not_called()
+
+    async def test_contact_button_requests_contact(self):
+        bot.db=AsyncMock();bot.db.saved_phone.return_value=None
+        message=self.message('');await bot.ask_phone(message,2,{'operation':'x'})
+        button=message.answer.call_args.kwargs['reply_markup'].keyboard[0][0]
+        self.assertEqual(button.text,'Поделиться номером');self.assertTrue(button.request_contact)
+
+    async def test_cart_callback_size(self):
+        for code,_,_ in SERVICES:
+            self.assertLessEqual(len(f'cminus:{"a"*32}:{code}:123456789012'.encode()),64)
 
 if __name__=='__main__':unittest.main()

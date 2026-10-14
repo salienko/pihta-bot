@@ -1,6 +1,6 @@
 import unittest
 from datetime import datetime, date, timedelta
-from domain import TZ, RuleError, horizon, price, window, claim_allowed, money, SLOTS
+from domain import TZ, RuleError, horizon, price, window, claim_allowed, money, SLOTS, normalize_phone, sorted_services, SERVICES
 
 class RulesTests(unittest.TestCase):
     def dt(self,hour,day=15):return datetime(2026,10,day,hour,tzinfo=TZ)
@@ -44,5 +44,16 @@ class RulesTests(unittest.TestCase):
         self.assertEqual(money('1500,50'),150050)
         for value in ('NaN','Infinity','-1','0','1.001','bad'):
             with self.subTest(value=value),self.assertRaises(RuleError):money(value)
+
+    def test_russian_phone_formats(self):
+        for phone in ['+7 (981) 244-00-50','8 981 244 00 50','79812440050','9812440050']:
+            self.assertEqual(normalize_phone(phone),'+79812440050')
+        for phone in ['981781345','+3809812440050','123','phone','+89812440050','+798124400500']:
+            with self.subTest(phone=phone),self.assertRaises(RuleError):normalize_phone(phone)
+
+    def test_services_brooms_first_then_alphabetical(self):
+        items=sorted_services([{'code':c,'name':n} for c,n,_ in SERVICES])
+        self.assertEqual([r['code'] for r in items[:2]],['birch','oak'])
+        self.assertEqual([r['name'] for r in items[2:]],sorted(r['name'] for r in items[2:]))
 
 if __name__=='__main__':unittest.main()

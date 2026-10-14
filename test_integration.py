@@ -87,6 +87,44 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         await self.pool.execute("UPDATE booking SET release_at=now()-interval '1 second' WHERE id=$1",ident)
         with self.assertRaises(RuleError):await self.db.send_link(1,rid,'https://example.com/pay')
 
+    async def test_reopen_expired_slot_only_if_free(self):
+        ident=await self.create()
+        await self.pool.execute("UPDATE booking SET release_at=now()-interval '1 second' WHERE id=$1",ident)
+        await self.db.maintenance()
+        old=await self.db.get(ident,2)
+        await self.db.reopen_for_payment(2,ident,'rules')
+        reopened=await self.db.get(ident,2)
+        self.assertEqual(reopened['status'],'held');self.assertGreater(reopened['release_at'],old['release_at'])
+        deadline=reopened['release_at']
+        await self.db.reopen_for_payment(2,ident,'rules')
+        self.assertEqual((await self.db.get(ident,2))['release_at'],deadline)
+        await self.pool.execute("UPDATE booking SET release_at=now()-interval '1 second' WHERE id=$1",ident)
+        await self.db.maintenance();await self.create(3)
+        with self.assertRaises(RuleError):await self.db.reopen_for_payment(2,ident,'rules')
+        self.assertEqual((await self.db.get(ident,2))['status'],'expired')
+
+    async def test_basket_atomic_and_idempotent(self):
+        ident=await self.create()
+        await self.pool.execute("INSERT INTO service_catalog VALUES('oak','Веник дубовый',60000,true)")
+        await self.db.service_basket(2,ident,{'towel':3,'oak':2},'basket-one')
+        await self.db.service_basket(2,ident,{'towel':3,'oak':2},'basket-one')
+        self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM booking_service'),2)
+        with self.assertRaises(RuleError):await self.db.service_basket(2,ident,{'towel':1,'missing':2},'basket-two')
+        self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM booking_service'),2)
+
+    async def test_saved_contact_is_owned(self):
+        await self.db.save_phone(2,'89812440050')
+        self.assertEqual(await self.db.saved_phone(2),'+79812440050')
+        self.assertIsNone(await self.db.saved_phone(3))
+
+    async def test_cart_parallel_increments(self):
+        ident=await self.create()
+        await self.db.set_session(2,'cart',{'booking':ident,'cart':{},'token':'token'})
+        await asyncio.gather(self.db.cart_adjust(2,ident,'towel','token',1),self.db.cart_adjust(2,ident,'towel','token',1))
+        _,data=await self.db.session(2)
+        self.assertEqual(data['cart']['towel'],2)
+        with self.assertRaises(RuleError):await self.db.cart_adjust(2,ident,'towel','stale',1)
+
     async def test_backup_restore_in_empty_schema(self):
         import gzip,json,tempfile
         from backup import snapshot,TABLES

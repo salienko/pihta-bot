@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, date
 from pathlib import Path
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message, CallbackQuery, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
-from domain import TZ, SLOTS, RuleError, now, horizon, rub, money, window
+from domain import TZ, SLOTS, RuleError, now, horizon, rub, money, window, normalize_phone, sorted_services
 from store import Store, uid
 
 SITE='https://banyapihta.ru/'
@@ -29,6 +29,39 @@ async def ready(message):
     if not db:
         await message.answer('Бронирование сейчас настраивается. Администратор: '+PHONE);return False
     return True
+
+async def ask_phone(message,actor,data,use_saved=True):
+    saved=await db.saved_phone(actor) if use_saved else None
+    if saved:
+        data['phone']=saved;await db.set_session(actor,'phone_confirm',data)
+        await confirm_phone(message,data)
+    else:
+        await db.set_session(actor,'phone',data)
+        await message.answer('Поделитесь своим номером через кнопку или введите российский номер для связи.',reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='Поделиться номером',request_contact=True)],[KeyboardButton(text='Отмена')]],resize_keyboard=True,one_time_keyboard=True))
+
+async def confirm_phone(message,data):
+    token=data['operation']
+    await message.answer(f'Использовать этот номер для связи: {data["phone"]}?',reply_markup=kb([[('Да',f'phoneyes:{token}'),('Использовать другой номер',f'phoneother:{token}')]]))
+
+async def show_cart(message,actor,edit=False):
+    state,d=await db.session(actor)
+    if state!='cart':raise RuleError('Откройте услуги заново.')
+    items=sorted_services(await db.pool.fetch('SELECT * FROM service_catalog WHERE active'))
+    rows=[];total=0
+    for item in items:
+        code=item['code'];quantity=d['cart'].get(code,0);total+=quantity*item['price']
+        base=f'{d["booking"]}:{code}:{d["token"]}'
+        rows.append([(f'{item["name"]} · {rub(item["price"])}'+(f' · {quantity} шт.' if quantity else ''),f'cplus:{base}')])
+        if quantity:rows.append([('−',f'cminus:{base}'),(f'{quantity} шт.',f'cartinfo:{d["token"]}'),('+',f'cplus:{base}')])
+    rows.append([(f'Отправить выбранное · {rub(total)}',f'csend:{d["booking"]}:{d["token"]}')])
+    rows.append([('Отмена',f'cdiscard:{d["booking"]}:{d["token"]}')])
+    text='Выберите несколько услуг. Нажатие на название добавляет одну единицу; «−» и «+» меняют количество. Затем нажмите «Отправить выбранное».\nПредварительная сумма '+rub(total)+'. Выполнение подтвердит администратор.'
+    if edit:
+        from aiogram.exceptions import TelegramBadRequest
+        try:await message.edit_text(text,reply_markup=kb(rows))
+        except TelegramBadRequest as e:
+            if 'message is not modified' not in str(e):raise
+    else:await message.answer(text,reply_markup=kb(rows))
 
 async def dates(message,offset=0):
     today=now().date();last=horizon(today);rows=[]
@@ -58,6 +91,7 @@ async def show_order(message,ident,actor):
             buttons.append([('Я оплатил' if b['status']=='held' else 'Доплатить',f'pay:{ident}')])
         buttons.append([('Добавить услуги',f'services:{ident}')])
         if b['status']!='held':buttons.append([('Запрос отмены',f'cancel:{ident}'),('Запрос переноса',f'move:{ident}')])
+    if actor==b['guest_id'] and b['status']=='expired':buttons.append([('Заплатить сейчас',f'paynow:{ident}')])
     if await db.role(actor):
         text+=f'\nГость: {b["name"]}, {b["phone"]}, Telegram ID {b["guest_id"]}'
         for c in await db.pool.fetch("SELECT * FROM payment_claim WHERE booking_id=$1 AND status='pending'",ident):
@@ -89,7 +123,7 @@ async def message_handler(message:Message):
     actor=message.from_user.id;text=(message.text or '').strip()
     try:
         if text.startswith('/id'):await message.answer(f'Ваш Telegram ID: {actor}');return
-        if text in ('/start','/cancel'):
+        if text in ('/start','/cancel','Отмена'):
             if db:await db.set_session(actor,'',{})
             await message.answer('Добро пожаловать в баню «Пихта»! Выберите раздел.',reply_markup=MENU)
             if db and await db.role(actor):await message.answer('Управление: /admin')
@@ -101,7 +135,7 @@ async def message_handler(message:Message):
             await message.answer('Первые 2 часа / дополнительный час:\nБудни до 19:00: 5000 / 2300 ₽\nБудни с 19:00 и выходные: 6000 / 2800 ₽\nПраздники: 6500 / 3000 ₽, либо тариф указанной администратором даты.\n4 платных гостя включены; сверх — 250 ₽/ч на человека. Дети до 6 включительно без доплаты, но в лимите 8.\nДлинная аренда по фактическим часам; оформляет администратор.');return
         if text=='Услуги':
             if await ready(message):
-                items=await db.pool.fetch('SELECT name,price FROM service_catalog WHERE active ORDER BY code')
+                items=sorted_services(await db.pool.fetch('SELECT code,name,price FROM service_catalog WHERE active'))
                 await message.answer('\n'.join(f'{r["name"]}: {rub(r["price"])}' for r in items)+'\nЗаказать: Мои бронирования → Добавить услуги. Выполнение подтверждает администратор.')
             return
         if not await ready(message):return
@@ -120,14 +154,16 @@ async def message_handler(message:Message):
         if state=='children':
             value=int(text)
             if not 0<=value<=data['guests']:raise RuleError('Детей не больше общего числа гостей.')
-            data['children']=value;await db.set_session(actor,'name',data);await message.answer('Укажите имя для брони.');return
+            data['children']=value;await db.set_session(actor,'name',data);await message.answer('Укажите Ваше имя для брони');return
         if state=='name':
             if not 2<=len(text)<=100:raise RuleError('Имя от 2 до 100 символов.')
-            data['name']=text;await db.set_session(actor,'phone',data);await message.answer('Укажите контактный телефон.');return
+            data['name']=text;await ask_phone(message,actor,data);return
         if state=='phone':
-            phone=message.contact.phone_number if message.contact and message.contact.user_id==actor else text
-            if not re.fullmatch(r'\+?[\d ()-]{10,25}',phone) or not 10<=len(re.sub(r'\D','',phone))<=15:raise RuleError('Введите телефон, например +7…')
-            data['phone']=phone;await db.set_session(actor,'phone',data);await summary(message,actor);return
+            if message.contact and message.contact.user_id!=actor:raise RuleError('Поделитесь своим номером, а не контактом другого человека.')
+            phone=message.contact.phone_number if message.contact else text
+            data['phone']=normalize_phone(phone);await db.set_session(actor,'phone_confirm',data);await confirm_phone(message,data);return
+        if state=='phone_confirm':
+            await confirm_phone(message,data);return
         if state=='pay':
             await db.claim(actor,data['booking'],money(text));await db.set_session(actor,'',{})
             await message.answer('Заявление принято. Бронь остаётся занятой до решения администратора.');await show_order(message,data['booking'],actor);return
@@ -203,6 +239,20 @@ async def callback_handler(call:CallbackQuery):
         if not db:raise RuleError('Бронирование пока настраивается.')
         action,_,value=data.partition(':')
         if action=='order':await show_order(message,value,actor)
+        elif action in ('phoneyes','phoneother'):
+            state,d=await db.session(actor)
+            if state!='phone_confirm' or d.get('operation')!=value:raise RuleError('Это подтверждение устарело. Продолжите текущее оформление.')
+            if action=='phoneother':await ask_phone(message,actor,d,False)
+            else:
+                await db.save_phone(actor,d['phone'])
+                await message.answer('Номер для связи подтверждён.',reply_markup=MENU)
+                await summary(message,actor)
+        elif action=='paynow':
+            if not BOOKING_ENABLED:raise RuleError('Запись временно отключена.')
+            ident=await db.reopen_for_payment(actor,value,RULES_HASH)
+            await db.request_link(actor,ident)
+            await message.answer('Время свободно. Резерв возобновлён на 20 минут. Администратору отправлен запрос ссылки для оплаты; ссылка придёт сюда.')
+            await show_order(message,ident,actor)
         elif action=='dates':await dates(message,max(0,int(value)))
         elif action=='date':
             if not BOOKING_ENABLED:raise RuleError('Запись пока отключена.')
@@ -241,8 +291,23 @@ async def callback_handler(call:CallbackQuery):
             else:
                 await db.set_session(actor,'pay',{'booking':value});await message.answer('После фактической доплаты введите перечисленную сумму в рублях: всю или часть остатка. Для выхода /cancel.')
         elif action=='services':
-            await db.get(value,actor);items=await db.pool.fetch('SELECT * FROM service_catalog WHERE active ORDER BY code')
-            await message.answer('Выберите услугу; выполнение подтвердит администратор.',reply_markup=kb([[(r['name']+' '+rub(r['price']),f'svc:{value}:{r["code"]}')] for r in items]))
+            b=await db.get(value,actor)
+            if b['status'] not in ('held','payment_review','review_overdue','confirmed','in_progress'):raise RuleError('Заказ закрыт. Свяжитесь с администратором.')
+            await db.set_session(actor,'cart',{'booking':value,'cart':{},'token':uid()[:12]})
+            await show_cart(message,actor)
+        elif action in ('cplus','cminus'):
+            ident,code,token=value.split(':')
+            await db.cart_adjust(actor,ident,code,token,1 if action=='cplus' else -1)
+            await show_cart(message,actor,True)
+        elif action=='cartinfo':
+            await call.answer('Нажимайте «−» и «+», чтобы изменить количество.');return
+        elif action in ('csend','cdiscard'):
+            ident,token=value.split(':');state,d=await db.session(actor)
+            if state!='cart' or d.get('booking')!=ident or d.get('token')!=token:raise RuleError('Эта корзина уже обработана или устарела.')
+            if action=='csend':await db.service_basket(actor,ident,d['cart'],f'basket:{actor}:{ident}:{token}')
+            await db.set_session(actor,'',{})
+            await message.answer('Все выбранные услуги отправлены на подтверждение.' if action=='csend' else 'Выбор услуг отменён.')
+            await show_order(message,ident,actor)
         elif action=='svc':
             ident,code=value.split(':');await db.get(ident,actor);await db.set_session(actor,'qty',{'booking':ident,'code':code});await message.answer('Введите количество. Для выхода /cancel.')
         elif action=='cancel':await db.get(value,actor);await message.answer('Отправить запрос отмены? До одобрения время занято.',reply_markup=kb([[('Да, отправить',f'cancelok:{value}')]]))
@@ -309,6 +374,7 @@ async def worker(bot):
                 try:
                     if text:
                         markup=kb([[('Добавить услуги',f'services:{row["booking_id"]}'),('Доплатить',f'pay:{row["booking_id"]}')]]) if row['kind']=='remind_1' else None
+                        if row['kind']=='expired':markup=kb([[('Заплатить сейчас',f'paynow:{row["booking_id"]}')]])
                         await bot.send_message(row['chat_id'],text,reply_markup=markup)
                     await db.sent(row['id'])
                 except Exception:await db.sent(row['id'],'Telegram delivery failed')

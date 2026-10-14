@@ -74,6 +74,9 @@ CREATE TABLE IF NOT EXISTS ui_session (
  telegram_id bigint PRIMARY KEY, state text NOT NULL, data jsonb NOT NULL,
  updated_at timestamptz NOT NULL DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS guest_contact (
+ telegram_id bigint PRIMARY KEY, phone text NOT NULL, updated_at timestamptz NOT NULL DEFAULT now()
+);
 CREATE TABLE IF NOT EXISTS outbox (
  id bigserial PRIMARY KEY, chat_id bigint NOT NULL, text text NOT NULL,
  booking_id text REFERENCES booking(id), revision integer, kind text,

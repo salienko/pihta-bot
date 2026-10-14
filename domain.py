@@ -1,5 +1,6 @@
 """Pure booking rules. Amounts are integer kopecks, dates use bath timezone."""
 import calendar
+import re
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
@@ -80,3 +81,19 @@ def money(value):
 
 def rub(amount):
     return f'{amount / 100:,.2f}'.replace(',', ' ').replace('.00', '') + ' ₽'
+
+def normalize_phone(value):
+    value=str(value).strip()
+    if not re.fullmatch(r'\+?[0-9\s().-]+',value):
+        raise RuleError('Введите российский номер: +7XXXXXXXXXX, 8XXXXXXXXXX или 10 цифр без кода страны.')
+    digits=re.sub(r'[^0-9]','',value)
+    if value.startswith('+') and not (len(digits)==11 and digits.startswith('7')):
+        raise RuleError('Нужен российский номер с кодом +7.')
+    if len(digits)==10 and not value.startswith('+'):digits='7'+digits
+    elif len(digits)==11 and digits.startswith('8'):digits='7'+digits[1:]
+    if len(digits)!=11 or not digits.startswith('7') or digits[1]=='0':
+        raise RuleError('Проверьте номер: нужно 10 цифр после +7.')
+    return '+'+digits
+
+def sorted_services(items):
+    return sorted(items,key=lambda r:(0 if r['code'] in ('birch','oak') else 1,r['name'].casefold()))
