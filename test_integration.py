@@ -66,6 +66,27 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.db.totals(ident))[0],self.data()['quote']+30000)
         self.assertEqual((await self.db.get(ident,2))['start_at'].astimezone(TZ),self.start)
 
+    async def test_move_conflict_rolls_back_then_moves_atomically(self):
+        ident=await self.create();claim=await self.db.claim(2,ident,200000)
+        await self.db.decide_payment(1,claim,True)
+        other=self.data(3);other['start']=(self.start+timedelta(hours=3)).isoformat()
+        other['quote']=price(self.start+timedelta(hours=3),2,4,0)[0]
+        await self.db.hold(3,other,'rules','hold-other')
+        request=await self.db.change(2,ident,'move','13:00')
+        with self.assertRaises(RuleError):await self.db.decide_change(1,request,True,self.start+timedelta(hours=3))
+        self.assertEqual((await self.db.get(ident,2))['start_at'].astimezone(TZ),self.start)
+        target=self.start+timedelta(hours=6)
+        await self.db.decide_change(1,request,True,target)
+        moved=await self.db.get(ident,2)
+        self.assertEqual(moved['start_at'].astimezone(TZ),target)
+        self.assertEqual(moved['revision'],2)
+        await self.db.available(self.pool,self.start,self.start+timedelta(hours=3))
+
+    async def test_payment_link_rejected_after_expiry(self):
+        ident=await self.create();rid=await self.db.request_link(2,ident)
+        await self.pool.execute("UPDATE booking SET release_at=now()-interval '1 second' WHERE id=$1",ident)
+        with self.assertRaises(RuleError):await self.db.send_link(1,rid,'https://example.com/pay')
+
     async def test_backup_restore_in_empty_schema(self):
         import gzip,json,tempfile
         from backup import snapshot,TABLES
