@@ -234,6 +234,44 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.pool.fetchval('SELECT status FROM booking_service'),'rejected')
         self.assertEqual(await self.pool.fetchval('SELECT status FROM payment_link_request'),'closed')
 
+    async def test_complete_guest_checkout_handlers(self):
+        import bot
+        from unittest.mock import AsyncMock
+        from aiogram.types import Message,Chat,User,CallbackQuery,PhotoSize
+        saved_db,saved_enabled=bot.db,bot.BOOKING_ENABLED
+        bot.db=self.db;bot.BOOKING_ENABLED=True
+        def msg(text=None,photo=False):
+            m=Message(message_id=1,date=now(),chat=Chat(id=2,type='private'),from_user=User(id=2,is_bot=False,first_name='Test'),text=text)
+            for attr in ('answer','answer_photo','edit_text','edit_caption','edit_reply_markup'):object.__setattr__(m,attr,AsyncMock())
+            if photo:object.__setattr__(m,'photo',[PhotoSize(file_id='x',file_unique_id='x',width=900,height=270)])
+            return m
+        async def click(data):
+            m=msg(photo=True)
+            call=CallbackQuery(id=uuid.uuid4().hex,from_user=User(id=2,is_bot=False,first_name='Test'),chat_instance='x',data=data,message=m)
+            object.__setattr__(call,'answer',AsyncMock())
+            await bot.callback_handler(call)
+            for args in call.answer.call_args_list:
+                self.assertFalse(args.kwargs.get('show_alert'),args)
+            return m
+        try:
+            await click('slot:'+self.start.isoformat())
+            await bot.message_handler(msg('4'));await bot.message_handler(msg('0'))
+            token=await self.pool.fetchval('SELECT token FROM checkout_draft WHERE telegram_id=2')
+            await click(f'shop:rental:{token}::')
+            await click(f'shop:product:{token}:towel:')
+            from checkout_store import CheckoutStore
+            cs=CheckoutStore(self.db);_,d=await cs.read(2,token);nonce=d['item']['nonce']
+            await click(f'shop:plus:{token}::{nonce}');await click(f'shop:add:{token}::{nonce}')
+            await click(f'shop:cart:{token}::');await click(f'shop:checkout:{token}::')
+            self.assertEqual((await self.db.session(2))[0],'name')
+            await bot.message_handler(msg('Test'));await bot.message_handler(msg('79990000000'))
+            await click(f'phoneyes:{token}');await click(f'shop:consent:{token}::')
+            await click(f'shop:checkout:{token}::')
+            self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM booking'),1)
+            self.assertEqual(await self.pool.fetchval('SELECT quantity FROM booking_service'),2)
+            self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM payment_link_request'),1)
+        finally:bot.db=saved_db;bot.BOOKING_ENABLED=saved_enabled
+
     async def test_backup_restore_in_empty_schema(self):
         import gzip,json,tempfile
         from backup import snapshot,TABLES

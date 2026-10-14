@@ -21,6 +21,13 @@ STATUS={'held':'Резерв, ожидается оплата','payment_review':
 def kb(rows):
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t,callback_data=d) for t,d in row] for row in rows])
 
+def report_error(scope):
+    import sys,traceback
+    exc=sys.exc_info()[1]
+    frames=traceback.extract_tb(sys.exc_info()[2])
+    location=' > '.join(f'{Path(f.filename).name}:{f.lineno}:{f.name}' for f in frames[-5:])
+    logging.error('%s failed: %s at %s; values suppressed',scope,type(exc).__name__,location)
+
 def shop():
     import sys
     from checkout import CheckoutUI
@@ -204,7 +211,7 @@ async def message_handler(message:Message):
         await message.answer('Выберите раздел меню или /start.',reply_markup=MENU)
     except (ValueError,RuleError) as e:await message.answer(str(e) if isinstance(e,RuleError) else 'Проверьте формат ввода. Для выхода /cancel.')
     except Exception:
-        logging.error('Message processing failed; details suppressed');await message.answer('Операция не завершена. Повторите позже или свяжитесь с администратором; не оплачивайте повторно без сверки.')
+        report_error('Message');await message.answer('Операция не завершена. Повторите позже или свяжитесь с администратором; не оплачивайте повторно без сверки.')
 
 async def commands(message,actor,text):
     parts=text.split();cmd=parts[0].split('@')[0]
@@ -259,6 +266,8 @@ async def commands(message,actor,text):
 @dp.callback_query()
 async def callback_handler(call:CallbackQuery):
     if not call.message or call.message.chat.type!='private':return
+    if not isinstance(call.message,Message):
+        await call.answer('Сообщение недоступно. Откройте /start для актуального меню.',show_alert=True);return
     actor=call.from_user.id;message=call.message;data=call.data or ''
     try:
         if data=='rules':await call.answer();await chunks(message,RULES);return
@@ -365,7 +374,7 @@ async def callback_handler(call:CallbackQuery):
         await call.answer()
     except (ValueError,RuleError) as e:await call.answer(str(e)[:190] if isinstance(e,RuleError) else 'Проверьте формат данных.',show_alert=True)
     except Exception:
-        logging.error('Callback processing failed; details suppressed');await call.answer('Ошибка. Проверьте актуальный заказ перед повтором.',show_alert=True)
+        report_error('Callback');await call.answer('Ошибка. Проверьте актуальный заказ перед повтором.',show_alert=True)
 
 async def admin_action(message,actor,action):
     async with db.write() as c:await db.staff(actor,c)
