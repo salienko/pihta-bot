@@ -1,72 +1,166 @@
+"""Offline Telegram dispatch tests. PostgreSQL uses a disposable test schema."""
+from dataclasses import replace
+from datetime import timedelta
+import json
+import os
 import unittest
-from unittest.mock import AsyncMock
-from aiogram.types import Message, Chat, User, CallbackQuery
-from datetime import datetime
-import bot
-from domain import SERVICES
+import uuid
 
-class UITests(unittest.IsolatedAsyncioTestCase):
-    def message(self,text,user=2):
-        message=Message(message_id=1,date=datetime.now(),chat=Chat(id=user,type='private'),from_user=User(id=user,is_bot=False,first_name='Test'),text=text)
-        object.__setattr__(message,'answer',AsyncMock())
-        return message
-    async def asyncSetUp(self):self.previous=bot.db
-    async def asyncTearDown(self):bot.db=self.previous
-    async def test_menu_without_database(self):
-        bot.db=None
-        for text in ['/start','/id','Цены','Правила','О бане','Связаться с нами','Забронировать']:
-            with self.subTest(text=text):
-                message=self.message(text);await bot.message_handler(message);self.assertTrue(message.answer.called)
-    async def test_guests_validation(self):
-        bot.db=AsyncMock();bot.db.session.return_value=('guests',{})
-        message=self.message('9');await bot.message_handler(message)
-        bot.db.set_session.assert_not_called()
-        self.assertIn('1 до 8',message.answer.call_args.args[0])
-    async def test_children_validation(self):
-        bot.db=AsyncMock();bot.db.session.return_value=('children',{'guests':4})
-        message=self.message('5');await bot.message_handler(message)
-        bot.db.set_session.assert_not_called()
-    async def test_phone_validation(self):
-        bot.db=AsyncMock();bot.db.session.return_value=('phone',{})
-        message=self.message('----------');await bot.message_handler(message)
-        bot.db.set_session.assert_not_called()
-    async def test_pending_link_input(self):
-        bot.db=AsyncMock();bot.db.session.return_value=('sendlink',{'request':'r'})
-        bot.db.send_link.return_value='b'
-        old=bot.show_order;bot.show_order=AsyncMock()
+import asyncpg
+from aiogram import Bot, Dispatcher
+from aiogram.client.session.base import BaseSession
+from aiogram.fsm.storage.memory import SimpleEventIsolation
+from aiogram.methods import AnswerCallbackQuery, EditMessageText, SendMessage
+from aiogram.types import CallbackQuery, Chat, Contact, Message, Update, User
+
+from bot import OrderBot, deliver_once
+from domain import now
+from settings import load
+from store import Store
+
+
+class RecordingSession(BaseSession):
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    async def close(self):
+        pass
+
+    async def make_request(self, bot, method, timeout=None):
+        self.calls.append(method)
+        if isinstance(method, AnswerCallbackQuery):
+            return True
+        if isinstance(method, (SendMessage, EditMessageText)):
+            return Message(message_id=len(self.calls), date=now(),
+                           chat=Chat(id=int(method.chat_id), type='private'),
+                           from_user=User(id=42, is_bot=True, first_name='Пихта'),
+                           text=method.text).as_(bot)
+        return True
+
+    async def stream_content(self, *args, **kwargs):
+        if False:
+            yield b''
+
+
+@unittest.skipUnless(os.getenv('TEST_DATABASE_URL'), 'Set TEST_DATABASE_URL for dispatcher tests')
+class FlowTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.schema = 'test_ui_' + uuid.uuid4().hex
+        self.settings = replace(load(), database_url=os.environ['TEST_DATABASE_URL'], admin_ids=(1,))
+        self.store = await Store.connect(self.settings, self.schema)
+        self.session = RecordingSession()
+        self.bot = Bot('42:TEST_TOKEN_FOR_OFFLINE_TESTS', session=self.session)
+        self.app = OrderBot(self.settings, self.store)
+        self.dp = Dispatcher(events_isolation=SimpleEventIsolation())
+        self.dp.include_router(self.app.router)
+        self.number = 0
+
+    async def asyncTearDown(self):
+        await self.bot.session.close()
+        await self.store.pool.close()
+        db = await asyncpg.connect(os.environ['TEST_DATABASE_URL'])
         try:
-            message=self.message('https://example.com/pay',1);await bot.message_handler(message)
-            bot.db.send_link.assert_awaited_once_with(1,'r','https://example.com/pay')
-        finally:bot.show_order=old
-    async def test_callback_size(self):
-        for action in ['order','pay','services','sendlink','cancelok','rejectask']:
-            markup=bot.kb([[('Test',action+':'+('a'*32))]])
-            self.assertLessEqual(len(markup.inline_keyboard[0][0].callback_data.encode()),64)
+            await db.execute(f'DROP SCHEMA {self.schema} CASCADE')
+        finally:
+            await db.close()
 
-    async def test_own_contact_normalized_before_confirmation(self):
-        from aiogram.types import Contact
-        bot.db=AsyncMock();bot.db.session.return_value=('phone',{'operation':'x'})
-        message=self.message('')
-        object.__setattr__(message,'contact',Contact(phone_number='89812440050',first_name='Test',user_id=2))
-        await bot.message_handler(message)
-        bot.db.set_session.assert_awaited_once_with(2,'phone_confirm',{'operation':'x','phone':'+79812440050'})
-        markup=message.answer.call_args.kwargs['reply_markup']
-        self.assertEqual([b.text for b in markup.inline_keyboard[0]],['Да','Использовать другой номер'])
+    async def send(self, text='', callback=None, actor=2, contact=None):
+        self.number += 1
+        user = User(id=actor, is_bot=False, first_name='Иван', username='ivan')
+        message = Message(message_id=self.number, date=now(), chat=Chat(id=actor, type='private'),
+                          from_user=user, text=text or None, contact=contact)
+        if callback:
+            update = Update(update_id=self.number, callback_query=CallbackQuery(
+                id=str(self.number), from_user=user, chat_instance='test', message=message, data=callback))
+        else:
+            update = Update(update_id=self.number, message=message)
+        await self.dp.feed_update(self.bot, update)
 
-    async def test_foreign_contact_not_accepted(self):
-        from aiogram.types import Contact
-        bot.db=AsyncMock();bot.db.session.return_value=('phone',{'operation':'x'})
-        message=self.message('');object.__setattr__(message,'contact',Contact(phone_number='89812440050',first_name='Other',user_id=3))
-        await bot.message_handler(message);bot.db.set_session.assert_not_called()
+    def texts(self):
+        return '\n'.join(method.text for method in self.session.calls if isinstance(method, (SendMessage, EditMessageText)))
 
-    async def test_contact_button_requests_contact(self):
-        bot.db=AsyncMock();bot.db.saved_phone.return_value=None
-        message=self.message('');await bot.ask_phone(message,2,{'operation':'x'})
-        button=message.answer.call_args.kwargs['reply_markup'].keyboard[0][0]
-        self.assertEqual(button.text,'Поделиться номером');self.assertTrue(button.request_contact)
+    async def to_services(self):
+        await self.send('Оставить заказ')
+        token = (await self.store.draft(2))['token']
+        day = (now() + timedelta(days=1)).date().isoformat()
+        for action, value in (('day', day), ('slot', '10'), ('hours', '2')):
+            await self.send(callback=self.app.button(action, token, value))
+        await self.send('8')
+        await self.send('2')
+        self.assertEqual((await self.store.draft(2))['state'], 'services')
+        return token
 
-    async def test_cart_callback_size(self):
-        for code,_,_ in SERVICES:
-            self.assertLessEqual(len(f'cminus:{"a"*32}:{code}:123456789012'.encode()),64)
+    async def to_review(self):
+        token = await self.to_services()
+        await self.send(callback=self.app.button('plus', token, 'birch'))
+        await self.send(callback=self.app.button('plus', token, 'birch'))
+        await self.send(callback=self.app.button('contacts', token))
+        await self.send('Иван Иванов')
+        await self.send('8 (981) 244-00-50')
+        await self.send(callback=self.app.button('phoneyes', token))
+        self.assertEqual((await self.store.draft(2))['state'], 'review')
+        return token
 
-if __name__=='__main__':unittest.main()
+    async def test_full_guest_flow_admin_delivery_and_duplicate_click(self):
+        await self.send('/start')
+        token = await self.to_review()
+        await self.send(callback=self.app.button('consent', token))
+        await self.send(callback=self.app.button('submit', token))
+        await self.send(callback=self.app.button('submit', token))
+        self.assertIn('Заказ сохранён и ожидает передачи', self.texts())
+        self.assertIn('повторная заявка не создавалась', self.texts())
+        self.assertEqual(await self.store.pool.fetchval('SELECT count(*) FROM orders'), 1)
+        await deliver_once(self.bot, self.store)
+        admin_messages = [m for m in self.session.calls if isinstance(m, SendMessage) and m.chat_id == 1]
+        self.assertEqual(len(admin_messages), 1)
+        self.assertIn('Иван Иванов', admin_messages[0].text)
+        self.assertIn('Веник берёзовый × 2', admin_messages[0].text)
+        await self.send('/admin', actor=1)
+        self.assertIn('Заказы для обработки', self.texts())
+        for method in self.session.calls:
+            markup = getattr(method, 'reply_markup', None)
+            if hasattr(markup, 'inline_keyboard'):
+                for row in markup.inline_keyboard:
+                    for button in row:
+                        self.assertLessEqual(len(button.callback_data.encode()), 64)
+
+    async def test_consent_required_and_contact_ownership(self):
+        token = await self.to_services()
+        await self.send(callback=self.app.button('contacts', token))
+        await self.send('Иван')
+        await self.send(contact=Contact(phone_number='89812440050', first_name='Другой', user_id=99))
+        self.assertEqual((await self.store.draft(2))['state'], 'phone')
+        self.assertIn('ваш собственный контакт', self.texts())
+        await self.send(contact=Contact(phone_number='89812440050', first_name='Иван', user_id=2))
+        await self.send(callback=self.app.button('phoneyes', token))
+        await self.send(callback=self.app.button('submit', token))
+        self.assertEqual(await self.store.pool.fetchval('SELECT count(*) FROM orders'), 0)
+        self.assertIn('подтвердите согласие', self.texts())
+
+    async def test_info_does_not_need_draft_and_has_no_payment_actions(self):
+        for text in ('О бане', 'Цены', 'Услуги', 'Правила', 'Контакты', 'Как это работает'):
+            await self.send(text)
+        await self.send('/admin', actor=2)
+        self.assertIn('Нет доступа', self.texts())
+        self.assertIn('Баня на дровах', self.texts())
+        for method in self.session.calls:
+            markup = getattr(method, 'reply_markup', None)
+            if hasattr(markup, 'inline_keyboard'):
+                for row in markup.inline_keyboard:
+                    self.assertFalse(any('оплат' in b.text.lower() for b in row))
+
+    async def test_old_button_cannot_change_new_order_and_forged_slot_rejected(self):
+        token = await self.to_services()
+        await self.send('Оставить заказ')
+        await self.send(callback=self.app.button('plus', token, 'birch'))
+        self.assertIn('из старого заказа', self.texts())
+        token = (await self.store.draft(2))['token']
+        day = (now() + timedelta(days=1)).date().isoformat()
+        await self.send(callback=self.app.button('day', token, day))
+        await self.send(callback=self.app.button('slot', token, '34'))
+        self.assertEqual((await self.store.draft(2))['state'], 'slot')
+
+
+if __name__ == '__main__':
+    unittest.main()
