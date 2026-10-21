@@ -58,7 +58,7 @@ def make_app(store,settings,secure=True):
         s=await auth(request);offset=max(0,int(request.query.get('offset','0')));rows=await store.listing(s['actor'],staff=True,offset=offset)
         day=date_value=request.query.get('day',datetime.now(TZ).date().isoformat())
         start=datetime.fromisoformat(day).replace(tzinfo=TZ);end=start+timedelta(days=1)
-        calendar_rows=await store.pool.fetch('SELECT * FROM bookings WHERE starts_at<$2 AND blocked_until>$1 ORDER BY starts_at',start,end)
+        calendar_rows=await store.pool.fetch("SELECT * FROM bookings WHERE starts_at<$2 AND blocked_until>$1 AND status IN ('pending','confirmed','completed','expired') ORDER BY starts_at",start,end)
         body=navigation(s)+'<h1>Бронирования</h1><p>Подтверждение относится ко всему составу. Отправленный заказ не редактируется.</p>'
         from booking_store import unpack
         body+='<div class="card"><h2>Календарь</h2><form><label>Дата<input type="date" name="day" value="'+e(day)+'"></label><button>Показать</button></form>'
