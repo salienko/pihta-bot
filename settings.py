@@ -17,6 +17,7 @@ class Settings:
     content: dict
     rules: str
     rules_hash: str
+    web_url: str = ''
 
 
 def load():
@@ -38,10 +39,16 @@ def load():
             raise ValueError('Проверьте праздничный тариф.')
         if not isinstance(rate.get('label'), str) or not 1 <= len(rate['label']) <= 80:
             raise ValueError('Проверьте название праздничного тарифа.')
-    admin_values = os.getenv('ADMIN_TELEGRAM_IDS', '').strip() or os.getenv('OWNER_TELEGRAM_ID', '').strip()
+    admin_values = ','.join(filter(None,(os.getenv('ADMIN_TELEGRAM_IDS', '').strip(),os.getenv('OWNER_TELEGRAM_ID', '').strip())))
     ids = tuple(dict.fromkeys(int(value.strip()) for value in admin_values.split(',') if value.strip()))
     if any(value <= 0 for value in ids):
         raise ValueError('Нужны положительные Telegram ID администраторов.')
+    from urllib.parse import urlparse
+    web_url=os.getenv('WEB_BASE_URL','').strip().rstrip('/')
+    if web_url:
+        parsed=urlparse(web_url)
+        if parsed.scheme!='https' or not parsed.netloc or parsed.path or parsed.query or parsed.fragment or parsed.username:
+            raise ValueError('WEB_BASE_URL must be an HTTPS origin')
     return Settings(os.getenv('BOT_TOKEN', '').strip(), ids,
                     os.getenv('DATABASE_URL', '').strip(),
-                    content, rules, hashlib.sha256(rules.encode()).hexdigest())
+                    content, rules, hashlib.sha256(rules.encode()).hexdigest(), web_url)

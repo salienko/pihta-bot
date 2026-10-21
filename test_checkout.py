@@ -1,1 +1,1 @@
-# Legacy checkout tests are superseded by test_ui.py and test_integration.py for order intake.
+"""Superseded by test_booking.py; original tests remain in legacy_tests and Git history."""

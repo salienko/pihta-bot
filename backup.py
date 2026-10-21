@@ -8,9 +8,9 @@ from pathlib import Path
 import re
 
 import asyncpg
-from store import SCHEMA
+from booking_store import SCHEMA
 
-TABLES = ('customers', 'drafts', 'orders', 'deliveries')
+TABLES = ('profiles','drafts','bookings','audit','outbox','operations','calendar_blocks','service_settings','holiday_rates')
 
 
 async def snapshot(url, folder, schema=SCHEMA):
@@ -27,7 +27,7 @@ async def snapshot(url, folder, schema=SCHEMA):
         result = folder / f'pihta-orders-{stamp}.json.gz'
         temporary = result.with_suffix('.tmp')
         with gzip.open(temporary, 'wt', encoding='utf-8') as handle:
-            json.dump({'format': 1, 'schema': schema, 'created_at': stamp, 'tables': tables}, handle, ensure_ascii=False)
+            json.dump({'format': 2, 'schema': schema, 'created_at': stamp, 'tables': tables}, handle, ensure_ascii=False)
         temporary.replace(result)
         return result
     finally:
