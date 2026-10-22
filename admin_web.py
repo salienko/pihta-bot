@@ -68,8 +68,9 @@ def make_app(store,settings,secure=True):
         body+='</div><div class="card"><h2>Список заявок</h2><nav>'+''.join('<a href="/?status='+key+'">'+label+'</a>' for key,label in [('pending','Ждут решения'),('confirmed','Подтверждены'),('all','Все записи')])+'</nav></div><div class="card scroll"><table><tr><th>Дата</th><th>Бронь</th><th>Статус</th><th>Итог</th></tr>'
         for r in rows[:20]:body+=f'<tr><td>{r["starts_at"].astimezone(TZ):%d.%m.%Y %H:%M}</td><td><a href="/booking/{e(r["id"])}">{e(r["id"])}</a></td><td>{e(LABELS[r["status"]])}</td><td>{e(rub(r["estimate"]["total"]))}</td></tr>'
         body+='</table></div>'
-        if offset:body+=f'<a href="/?status={e(status_filter or 'all')}&amp;offset={max(0,offset-20)}">← Назад</a> '
-        if len(rows)>20:body+=f'<a href="/?status={e(status_filter or 'all')}&amp;offset={offset+20}">Далее →</a>'
+        status_query=e(status_filter or 'all')
+        if offset:body+=f'<a href="/?status={status_query}&amp;offset={max(0,offset-20)}">← Назад</a> '
+        if len(rows)>20:body+=f'<a href="/?status={status_query}&amp;offset={offset+20}">Далее →</a>'
         errors=await store.pool.fetchval('SELECT count(*) FROM outbox WHERE delivered_at IS NULL AND last_error IS NOT NULL')
         body+=f'<p>Уведомлений с ошибками доставки: {errors}. В Telegram необходимо открыть /start для получения сообщений.</p>'
         body+='<div class="card"><h2>Закрыть время для записи</h2>'+form(s,'/block','<label>Начало<input name="start" type="datetime-local" required></label><label>Окончание, включая уборку<input name="end" type="datetime-local" required></label><label>Причина<input name="reason" minlength="2" maxlength="500" required></label>','Закрыть интервал')+'</div>'
