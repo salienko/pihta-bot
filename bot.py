@@ -6,11 +6,11 @@ from aiohttp import web
 from aiogram import Bot,Dispatcher
 from aiogram.fsm.storage.memory import SimpleEventIsolation
 from aiogram.exceptions import TelegramRetryAfter,TelegramForbiddenError
-from aiogram.types import BotCommand
 from settings import load
 from booking_store import BookingStore
 from booking_ui import BookingUI,kb
 from admin_web import make_app
+from bot_features import configured_features
 
 async def deliver_once(bot,store):
     row=await store.next_delivery()
@@ -52,16 +52,17 @@ async def main():
     try:
         lock=await store.pool.acquire()
         if not await lock.fetchval('SELECT pg_try_advisory_lock(7319842)'):raise SystemExit('Another bot instance is running.')
-        ui=BookingUI(settings,store);dp=Dispatcher(events_isolation=SimpleEventIsolation());dp.include_router(ui.router)
+        features=configured_features(settings,store)
+        ui=BookingUI(settings,store,features);dp=Dispatcher(events_isolation=SimpleEventIsolation());features.mount(dp,ui.router)
         async with Bot(settings.token) as bot:
             await bot.get_me()
             await bot.delete_webhook(drop_pending_updates=False)
-            await bot.set_my_commands([BotCommand(command='start',description='Главное меню'),BotCommand(command='admin',description='Вход в панель сотрудника'),BotCommand(command='id',description='Мой Telegram ID')])
+            await bot.set_my_commands(features.commands())
             if settings.web_url:
                 runner=web.AppRunner(make_app(store,settings),access_log=None);await runner.setup()
                 await web.TCPSite(runner,'0.0.0.0',int(os.getenv('PORT','8080'))).start()
             task=asyncio.create_task(worker(bot,store))
-            logging.info('Pihta booking v2 ready; web=%s',bool(settings.web_url))
+            logging.info('Pihta rental v3 ready; web=%s',bool(settings.web_url))
             await dp.start_polling(bot,allowed_updates=['message','callback_query'])
     finally:
         if task:

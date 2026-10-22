@@ -1,5 +1,4 @@
 """Single-resource booking service. Every calendar/status mutation takes one DB lock."""
-from settings import EXTRAS_ENABLED
 import hashlib
 import json
 import re
@@ -9,6 +8,7 @@ from datetime import datetime,timedelta
 from pathlib import Path
 import asyncpg
 from booking_domain import TZ,RuleError,estimate,validate_start,can_cancel,card,clean_name,normalize_phone
+from booking_flow import VERSION,require
 
 SCHEMA='pihta_booking_v2'
 LOCK=7319845
@@ -66,21 +66,35 @@ class BookingStore:
     async def begin(self,actor):
         async with self.tx() as db:
             old=unpack(await db.fetchrow('SELECT * FROM drafts WHERE telegram_id=$1',actor))
-            if old and old['state']!='submitted':return old['token']
+            if old and old['state'] not in ('submitted','discarded'):return old['token']
             token=secrets.token_hex(6);profile=await db.fetchrow('SELECT * FROM profiles WHERE telegram_id=$1',actor)
-            data={'guests':1,'children':0,'hours':2,'cart':{}}
+            data={'flow_version':VERSION,'guests':1,'children':0,'hours':2,'cart':{}}
             if profile:data.update(name=profile['name'],phone=profile['phone'])
-            await db.execute("INSERT INTO drafts VALUES($1,$2,'date',$3::jsonb,0) ON CONFLICT(telegram_id) DO UPDATE SET token=$2,state='date',data=$3::jsonb,revision=drafts.revision+1",actor,token,json.dumps(data))
+            await db.execute("INSERT INTO drafts VALUES($1,$2,'name',$3::jsonb,0) ON CONFLICT(telegram_id) DO UPDATE SET token=$2,state='name',data=$3::jsonb,revision=drafts.revision+1",actor,token,json.dumps(data))
             return token
 
     async def draft(self,actor,token=None):
         d=unpack(await self.pool.fetchrow('SELECT * FROM drafts WHERE telegram_id=$1',actor))
-        if not d or (token and token!=d['token']) or d['state']=='submitted':raise RuleError('Откройте новое оформление через «Забронировать».')
+        if not d or (token and token!=d['token']) or d['state'] in ('submitted','discarded'):raise RuleError('Откройте новое оформление через «Забронировать».')
         return d
 
     async def save(self,actor,d,state,data):
         result=await self.pool.execute('UPDATE drafts SET state=$1,data=$2::jsonb,revision=revision+1 WHERE telegram_id=$3 AND token=$4 AND revision=$5 AND state<>\'submitted\'',state,json.dumps(data,ensure_ascii=False),actor,d['token'],d['revision'])
         if result!='UPDATE 1':raise RuleError('Экран уже изменился. Откройте текущее оформление.')
+
+    async def abandon_draft(self,actor,d):
+        result=await self.pool.execute("UPDATE drafts SET state='discarded',revision=revision+1 WHERE telegram_id=$1 AND token=$2 AND revision=$3 AND state NOT IN ('submitted','discarded')",actor,d['token'],d['revision'])
+        if result!='UPDATE 1':raise RuleError('Черновик уже изменился.')
+
+    async def reset_draft(self,actor,d):
+        async with self.tx() as db:
+            row=unpack(await db.fetchrow('SELECT * FROM drafts WHERE telegram_id=$1 FOR UPDATE',actor))
+            if not row or row['token']!=d['token'] or row['revision']!=d['revision'] or row['state']=='submitted':
+                raise RuleError('Черновик уже изменился. Продолжите с актуального шага.')
+            profile=await db.fetchrow('SELECT * FROM profiles WHERE telegram_id=$1',actor)
+            data={'flow_version':VERSION,'guests':1,'children':0,'hours':2,'cart':{}}
+            if profile:data.update(name=profile['name'],phone=profile['phone'])
+            await db.execute("UPDATE drafts SET token=$1,state='name',data=$2::jsonb,revision=revision+1 WHERE telegram_id=$3",secrets.token_hex(6),json.dumps(data,ensure_ascii=False),actor)
 
     async def profile(self,actor,name=None,phone=None):
         if name is None:return unpack(await self.pool.fetchrow('SELECT * FROM profiles WHERE telegram_id=$1',actor))
@@ -106,7 +120,7 @@ class BookingStore:
             end=validate_start(start,clock)
             return not await self.blocked(db,start,end+timedelta(hours=1))
 
-    async def submit(self,actor,token,clock=None):
+    async def submit(self,actor,token,clock=None,expected_revision=None):
         async with self.tx() as db:
             clock=await self.clock(db,clock);await self.expire(db,clock)
             old=await db.fetchval('SELECT id FROM bookings WHERE telegram_id=$1 AND draft_token=$2',actor,token)
@@ -114,8 +128,11 @@ class BookingStore:
             d=unpack(await db.fetchrow('SELECT * FROM drafts WHERE telegram_id=$1 FOR UPDATE',actor))
             if not d or d['token']!=token or d['state']!='review':raise RuleError('Откройте итог текущего черновика.')
             data=d['data']
-            if not EXTRAS_ENABLED and data.get('cart'):
-                raise RuleError('Заказ дополнительных услуг временно недоступен. Откройте итог бронирования заново.')
+            if expected_revision is not None and d['revision']!=expected_revision:raise RuleError('Экран изменился. Проверьте итог заново.')
+            if data.get('flow_version')!=VERSION:raise RuleError('Продолжите оформление в новой версии бота.')
+            require(data,'review')
+            if data.get('cart'):
+                raise RuleError('Эта версия принимает только аренду. Откройте итог бронирования заново.')
             start=datetime.fromisoformat(data['start']);end=validate_start(start,clock)
             if not data.get('consent') or data.get('rules_hash')!=self.settings.rules_hash:raise RuleError('Примите актуальные правила.')
             data['name']=clean_name(data['name']);data['phone']=normalize_phone(data['phone'])
@@ -142,11 +159,12 @@ class BookingStore:
             if not r or (not staff and r['telegram_id']!=actor):raise RuleError('Бронь недоступна.')
             return r
 
-    async def listing(self,actor,history=False,staff=False,offset=0):
+    async def listing(self,actor,history=False,staff=False,offset=0,status_filter=None):
         if staff:self.admin(actor)
+        if status_filter not in (None,'pending','confirmed','cancelled','rejected','expired','completed'):raise RuleError('Выберите статус из списка.')
         async with self.tx() as db:
             clock=await self.clock(db);await self.expire(db,clock)
-            rows=await db.fetch("SELECT * FROM bookings WHERE ($1::boolean OR telegram_id=$2) AND ($3::boolean OR ((status IN ('pending','confirmed')) <> $4::boolean)) ORDER BY starts_at DESC,id LIMIT 21 OFFSET $5",staff,actor,staff,history,max(0,offset))
+            rows=await db.fetch("SELECT * FROM bookings WHERE ($1::boolean OR telegram_id=$2) AND ($3::boolean OR ((status IN ('pending','confirmed')) <> $4::boolean)) AND ($6::text IS NULL OR status=$6) ORDER BY starts_at DESC,id LIMIT 21 OFFSET $5",staff,actor,staff,history,max(0,offset),status_filter)
             return [unpack(r) for r in rows]
 
     async def legacy(self,actor,ident=None):

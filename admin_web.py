@@ -39,7 +39,7 @@ def make_app(store,settings,secure=True):
         return s
     def form(s,action,fields,label='Сохранить',danger=False):
         return f'<form method="post" action="{e(action)}"><input type="hidden" name="csrf" value="{e(s["csrf"])}"><input type="hidden" name="operation" value="{secrets.token_hex(16)}">'+fields+f'<button class="{"danger" if danger else ""}">{e(label)}</button></form>'
-    def navigation(s):return '<nav><a href="/">Заявки и календарь</a><a href="/catalog">Услуги и праздники</a><a href="/archive">Прежние заявки</a><a href="/audit">Журнал действий</a></nav>'+form(s,'/logout','','Выйти')
+    def navigation(s):return '<nav><a href="/">Заявки и календарь</a><a href="/catalog">Тарифы и праздники</a><a href="/archive">Прежние заявки</a><a href="/audit">Журнал действий</a></nav>'+form(s,'/logout','','Выйти')
 
     async def login_page(request):
         body='<div class="card"><h1>Вход администратора</h1><p>Получите личную одноразовую ссылку командой /admin в боте «Пихта».</p><form id="login" action="/login" method="post"><input type="hidden" id="token" name="token"><button id="enter" hidden>Войти</button></form><script src="/login.js" defer></script></div>'
@@ -55,21 +55,21 @@ def make_app(store,settings,secure=True):
         r=web.HTTPFound('/login');r.del_cookie('pihta_session');return r
 
     async def home(request):
-        s=await auth(request);offset=max(0,int(request.query.get('offset','0')));rows=await store.listing(s['actor'],staff=True,offset=offset)
+        s=await auth(request);offset=max(0,int(request.query.get('offset','0')));status_filter=request.query.get('status','pending');status_filter=None if status_filter=='all' else status_filter;rows=await store.listing(s['actor'],staff=True,offset=offset,status_filter=status_filter)
         day=date_value=request.query.get('day',datetime.now(TZ).date().isoformat())
         start=datetime.fromisoformat(day).replace(tzinfo=TZ);end=start+timedelta(days=1)
         calendar_rows=await store.pool.fetch("SELECT * FROM bookings WHERE starts_at<$2 AND blocked_until>$1 AND status IN ('pending','confirmed','completed','expired') ORDER BY starts_at",start,end)
-        body=navigation(s)+'<h1>Бронирования</h1><p>Подтверждение относится ко всему составу. Отправленный заказ не редактируется.</p>'
+        body=navigation(s)+'<h1>Бронирования</h1><p>Подтвердите аренду или откажите с причиной. Отправленная бронь не редактируется.</p>'
         from booking_store import unpack
         body+='<div class="card"><h2>Календарь</h2><form><label>Дата<input type="date" name="day" value="'+e(day)+'"></label><button>Показать</button></form>'
         for raw in calendar_rows:
             r=unpack(raw);body+=f'<p><a href="/booking/{e(r["id"])}">{r["starts_at"].astimezone(TZ):%H:%M}–{r["ends_at"].astimezone(TZ):%H:%M} · {e(LABELS[r["status"]])}</a> · уборка до {r["blocked_until"].astimezone(TZ):%H:%M}</p>'
         if not calendar_rows:body+='<p>Броней на дату нет.</p>'
-        body+='</div><div class="card scroll"><table><tr><th>Дата</th><th>Бронь</th><th>Статус</th><th>Итог</th></tr>'
+        body+='</div><div class="card"><h2>Список заявок</h2><nav>'+''.join('<a href="/?status='+key+'">'+label+'</a>' for key,label in [('pending','Ждут решения'),('confirmed','Подтверждены'),('all','Все записи')])+'</nav></div><div class="card scroll"><table><tr><th>Дата</th><th>Бронь</th><th>Статус</th><th>Итог</th></tr>'
         for r in rows[:20]:body+=f'<tr><td>{r["starts_at"].astimezone(TZ):%d.%m.%Y %H:%M}</td><td><a href="/booking/{e(r["id"])}">{e(r["id"])}</a></td><td>{e(LABELS[r["status"]])}</td><td>{e(rub(r["estimate"]["total"]))}</td></tr>'
         body+='</table></div>'
-        if offset:body+=f'<a href="/?offset={max(0,offset-20)}">← Назад</a> '
-        if len(rows)>20:body+=f'<a href="/?offset={offset+20}">Далее →</a>'
+        if offset:body+=f'<a href="/?status={e(status_filter or 'all')}&amp;offset={max(0,offset-20)}">← Назад</a> '
+        if len(rows)>20:body+=f'<a href="/?status={e(status_filter or 'all')}&amp;offset={offset+20}">Далее →</a>'
         errors=await store.pool.fetchval('SELECT count(*) FROM outbox WHERE delivered_at IS NULL AND last_error IS NOT NULL')
         body+=f'<p>Уведомлений с ошибками доставки: {errors}. В Telegram необходимо открыть /start для получения сообщений.</p>'
         body+='<div class="card"><h2>Закрыть время для записи</h2>'+form(s,'/block','<label>Начало<input name="start" type="datetime-local" required></label><label>Окончание, включая уборку<input name="end" type="datetime-local" required></label><label>Причина<input name="reason" minlength="2" maxlength="500" required></label>','Закрыть интервал')+'</div>'
@@ -80,7 +80,7 @@ def make_app(store,settings,secure=True):
     async def detail(request):
         s=await auth(request);r=await store.get(s['actor'],request.match_info['id'],staff=True)
         body=navigation(s)+'<h1>Бронь № '+e(r['id'])+'</h1><div class="card"><pre>'+e(card(r))+'</pre></div>'
-        if r['status']=='pending':body+='<div class="card">'+form(s,'/booking/'+r['id']+'/confirm','<p>Подтвердить время и все выбранные услуги?</p>','Подтвердить весь заказ')+'</div>'
+        if r['status']=='pending':body+='<div class="card">'+form(s,'/booking/'+r['id']+'/confirm','<p>Подтвердить бронирование бани?</p>','Подтвердить бронирование')+'</div>'
         if r['status'] in ('pending','confirmed'):
             body+='<div class="card">'+form(s,'/booking/'+r['id']+'/cancel','<label>Причина отмены<textarea name="reason" minlength="2" maxlength="500" required></textarea></label>','Отменить с уведомлением',True)+'</div>'
             if r['status']=='pending':body+='<div class="card">'+form(s,'/booking/'+r['id']+'/reject','<label>Причина отказа<textarea name="reason" minlength="2" maxlength="500" required></textarea></label>','Отказать',True)+'</div>'
@@ -88,7 +88,7 @@ def make_app(store,settings,secure=True):
         for action,title in [('payment','Фактически принято на месте'),('refund','Фактически возвращено вручную')]:
             body+='<div class="card"><h2>'+title+'</h2>'+form(s,'/booking/'+r['id']+'/'+action,'<label>Сумма, ₽<input name="amount" type="number" min="0.01" max="1000000" step="0.01" required></label><label>Комментарий<input name="note" minlength="2" maxlength="500" required></label>','Зафиксировать факт')+'</div>'
         body+='</div><div class="card"><h2>Фактическое посещение — отдельно от брони</h2><p>Исходная сумма и состав сохраняются. Меньшее число гостей не снижает стоимость.</p>'+form(s,'/booking/'+r['id']+'/actual','<label>Фактических гостей<input name="guests" type="number" min="1" max="8" required></label><label>Итог фактического расчёта, ₽<input name="total" type="number" min="0" step="0.01" required></label><label>Обоснование расчёта<textarea name="note" minlength="2" maxlength="500" required></textarea></label>')+'</div>'
-        body+='<div class="card"><h2>Связаться с гостем</h2><p>Например, уточнить наличие услуги. Сообщение не меняет заказ и занятость.</p>'+form(s,'/booking/'+r['id']+'/message','<label>Сообщение<textarea name="text" minlength="2" maxlength="1000" required></textarea></label>','Отправить гостю')+'</div>'
+        body+='<div class="card"><h2>Связаться с гостем</h2><p>Уточните детали посещения. Сообщение не меняет бронь и занятость.</p>'+form(s,'/booking/'+r['id']+'/message','<label>Сообщение<textarea name="text" minlength="2" maxlength="1000" required></textarea></label>','Отправить гостю')+'</div>'
         if r['status'] in ('confirmed','completed'):body+='<div class="card">'+form(s,'/booking/'+r['id']+'/no_show','<label>Комментарий<input name="note" minlength="2" maxlength="500" required></label>','Отметить неявку')+'</div>'
         events=await store.pool.fetch('SELECT * FROM audit WHERE booking_id=$1 ORDER BY id DESC LIMIT 100',r['id'])
         body+='<div class="card"><h2>История действий</h2>'
@@ -138,20 +138,12 @@ def make_app(store,settings,secure=True):
     async def health(request):
         try:await store.pool.fetchval('SELECT 1')
         except Exception:return web.json_response({'status':'unavailable'},status=503)
-        return web.json_response({'status':'ok'})
+        return web.json_response({'status':'ok','release':'rental-v3'})
     async def catalog(request):
-        s=await auth(request);items,holidays=await store.pricing();body=navigation(s)+'<h1>Услуги и праздничные даты</h1><p>Изменения доступности действуют для новых отправок. Состав отправленных броней остаётся прежним.</p>'
-        for code,i in items.items():body+='<div class="card"><h2>'+e(i['name'])+'</h2><p>'+e(rub(i['price']))+' · '+('Доступно' if i.get('available',True) else 'Нет в наличии')+'</p>'+form(s,'/catalog/'+code,'<input type="hidden" name="available" value="'+('0' if i.get('available',True) else '1')+'">','Снять с продажи' if i.get('available',True) else 'Вернуть в каталог')+'</div>'
+        s=await auth(request);items,holidays=await store.pricing();body=navigation(s)+'<h1>Тарифы и праздничные даты</h1><p>Пн–пт до 19:00: 5 000 ₽ за 2 часа. Вечером и в выходные: 6 000 ₽. Ниже задаются особые даты. Изменения относятся только к новым бронированиям.</p>'
         body+='<div class="card"><h2>Праздничный тариф</h2><p>Укажите каждую дату отдельно. Новогодняя цена задаётся явно.</p>'+form(s,'/holiday','<label>Дата<input name="day" type="date" required></label><label>Название<input name="label" maxlength="80" required></label><label>Первые 2 часа, ₽<input name="base" type="number" min="1" step="1" value="6500" required></label><label>Следующий час, ₽<input name="extra" type="number" min="1" step="1" value="3000" required></label>','Сохранить тариф')+'</div>'
-        for day,rate in sorted(holidays.items()):body+='<p>'+e(day)+' · '+e(rate['label'])+' · '+e(rub(rate['base']))+' / '+e(rub(rate['extra']))+'</p>'
+        for day,rate in sorted(holidays.items()):body+='<div class="card"><p>'+e(day)+' · '+e(rate['label'])+' · '+e(rub(rate['base']))+' / '+e(rub(rate['extra']))+'</p>'+form(s,'/holiday/remove','<input type="hidden" name="day" value="'+e(day)+'">','Убрать особый тариф')+'</div>'
         return web.Response(text=page('Каталог',body),content_type='text/html')
-    async def availability(request):
-        s=await auth(request,True);data=await request.post();code=request.match_info['code'];items,_=await store.pricing()
-        if code not in items:raise RuleError('Услуга не найдена.')
-        value=data.get('available')=='1'
-        async with store.tx() as db:
-            await db.execute('INSERT INTO service_settings VALUES($1,$2) ON CONFLICT(code) DO UPDATE SET available=$2',code,value);await store.audit(db,None,s['actor'],'availability',dict(code=code,available=value))
-        raise web.HTTPFound('/catalog')
     async def holiday(request):
         s=await auth(request,True);data=await request.post()
         from datetime import date
@@ -160,8 +152,17 @@ def make_app(store,settings,secure=True):
         async with store.tx() as db:
             await db.execute('INSERT INTO holiday_rates VALUES($1,$2,$3,$4) ON CONFLICT(day) DO UPDATE SET label=$2,base=$3,extra=$4',day,label,base,extra);await store.audit(db,None,s['actor'],'holiday',dict(day=day.isoformat(),label=label,base=base,extra=extra))
         raise web.HTTPFound('/catalog')
+    async def remove_holiday(request):
+        s=await auth(request,True);data=await request.post()
+        from datetime import date
+        day=date.fromisoformat(data['day'])
+        async with store.tx() as db:
+            await db.execute('DELETE FROM holiday_rates WHERE day=$1',day)
+            await store.audit(db,None,s['actor'],'holiday_removed',dict(day=day.isoformat()))
+        raise web.HTTPFound('/catalog')
+
     async def style(request):return web.Response(text=STYLE,content_type='text/css')
-    app.add_routes([web.get('/style.css',style),web.get('/health',health),web.get('/login',login_page),web.get('/login.js',login_js),web.post('/login',login),web.post('/logout',logout),web.get('/',home),web.get('/booking/{id}',detail),web.post('/booking/{id}/{action}',action),web.post('/block',block),web.post('/unblock/{id}',unblock),web.get('/archive',archive),web.get('/audit',audit),web.get('/catalog',catalog),web.post('/catalog/{code}',availability),web.post('/holiday',holiday)])
+    app.add_routes([web.get('/style.css',style),web.get('/health',health),web.get('/login',login_page),web.get('/login.js',login_js),web.post('/login',login),web.post('/logout',logout),web.get('/',home),web.get('/booking/{id}',detail),web.post('/booking/{id}/{action}',action),web.post('/block',block),web.post('/unblock/{id}',unblock),web.get('/archive',archive),web.get('/audit',audit),web.get('/catalog',catalog),web.post('/holiday',holiday),web.post('/holiday/remove',remove_holiday)])
     return app
 
 def re_full_token(value):

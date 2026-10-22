@@ -46,8 +46,6 @@ URL=os.getenv('TEST_DATABASE_URL','')
 @unittest.skipUnless(URL,'TEST_DATABASE_URL is required for PostgreSQL tests')
 class Database(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.extras_patches=[patch('booking_ui.EXTRAS_ENABLED',True),patch('booking_store.EXTRAS_ENABLED',True)]
-        for feature_patch in self.extras_patches:feature_patch.start();self.addCleanup(feature_patch.stop)
         self.schema='test_booking_'+secrets.token_hex(8);self.settings=replace(load(),database_url=URL,admin_ids=(1,),web_url='https://pihta.test')
         self.store=await BookingStore.connect(self.settings,self.schema)
         self.start=(datetime.now(TZ)+timedelta(days=4)).replace(hour=13,minute=0,second=0,microsecond=0)
@@ -56,26 +54,30 @@ class Database(unittest.IsolatedAsyncioTestCase):
         await self.store.pool.execute(f'DROP SCHEMA {self.schema} CASCADE');await self.store.pool.close()
     async def ready(self,actor=2,delta=0):
         t=await self.store.begin(actor);d=await self.store.draft(actor,t)
-        data=dict(start=(self.start+timedelta(days=delta)).isoformat(),hours=2,guests=2,children=0,cart={'oak':1},name='Иван',phone='+79812440050',consent=True,rules_hash=self.settings.rules_hash)
+        data=dict(start=(self.start+timedelta(days=delta)).isoformat(),hours=2,guests=2,children=0,cart={},flow_version=3,day=(self.start+timedelta(days=delta)).date().isoformat(),name='Иван',phone='+79812440050',consent=True,rules_hash=self.settings.rules_hash)
         data['quote']=estimate(data,self.catalog,{})
         await self.store.save(actor,d,'review',data);return t
     async def book(self,actor=2,delta=0):return (await self.store.submit(actor,await self.ready(actor,delta)))[0]
-    async def test_booking_only_resumes_old_cart_to_review(self):
+    async def test_migrate_legacy_draft_preserves_contacts_but_restarts_journey(self):
         token=await self.ready();d=await self.store.draft(2,token)
-        await self.store.save(2,d,'services',d['data'])
+        data=d['data'];data.pop('flow_version');data['cart']={'oak':2}
+        await self.store.save(2,d,'services',data)
         ui=BookingUI(self.settings,self.store);ui.say=AsyncMock()
-        with patch('booking_ui.EXTRAS_ENABLED',False):
-            await ui.render(None,2,await self.store.draft(2,token))
+        await ui.render(None,2,await self.store.draft(2,token))
         d=await self.store.draft(2,token)
-        self.assertEqual(d['state'],'review');self.assertEqual(d['data']['cart'],{})
-        self.assertFalse(d['data']['consent'])
-        self.assertEqual(d['data']['quote']['items'],[])
+        self.assertEqual(d['state'],'name');self.assertEqual(d['data']['cart'],{})
+        self.assertFalse(d['data']['consent']);self.assertEqual(d['data']['name'],'Иван')
 
-    async def test_booking_only_rejects_stale_cart_on_submit(self):
-        token=await self.ready()
-        with patch('booking_store.EXTRAS_ENABLED',False):
-            with self.assertRaisesRegex(RuleError,'временно недоступен'):
-                await self.store.submit(2,token)
+    async def test_rental_rejects_goods_in_backend(self):
+        token=await self.ready();d=await self.store.draft(2,token)
+        d['data']['cart']={'oak':1};await self.store.save(2,d,'review',d['data'])
+        with self.assertRaisesRegex(RuleError,'только аренду'):await self.store.submit(2,token)
+        self.assertEqual(await self.store.pool.fetchval('SELECT count(*) FROM bookings'),0)
+
+    async def test_submit_revision_is_checked_atomically(self):
+        token=await self.ready();d=await self.store.draft(2,token)
+        await self.store.save(2,d,'review',d['data'])
+        with self.assertRaises(RuleError):await self.store.submit(2,token,expected_revision=d['revision'])
         self.assertEqual(await self.store.pool.fetchval('SELECT count(*) FROM bookings'),0)
 
     async def test_concurrent_slot_only_one_winner(self):
@@ -141,9 +143,10 @@ class Database(unittest.IsolatedAsyncioTestCase):
             r=await client.get('/');self.assertEqual(r.status,200);self.assertIn('no-store',r.headers['Cache-Control']);self.assertIn('frame-ancestors',r.headers['Content-Security-Policy'])
             ident=await self.book();r=await client.post('/booking/'+ident+'/confirm',data={'csrf':'wrong'},headers={'Origin':self.settings.web_url});self.assertEqual(r.status,403)
         finally:await client.close()
-    async def test_unavailable_service_rechecked_on_submit(self):
+    async def test_old_inventory_does_not_affect_rental(self):
         t=await self.ready();await self.store.pool.execute("INSERT INTO service_settings VALUES('oak',false)")
-        with self.assertRaises(RuleError):await self.store.submit(2,t)
+        ident,_=await self.store.submit(2,t)
+        self.assertEqual((await self.store.get(2,ident))['estimate']['items'],[])
     async def test_price_change_requires_new_consent(self):
         t=await self.ready();await self.store.pool.execute('INSERT INTO holiday_rates VALUES($1,$2,$3,$4)',self.start.date(),'Праздник',650000,300000)
         with self.assertRaises(RuleError):await self.store.submit(2,t)
@@ -173,67 +176,169 @@ class Database(unittest.IsolatedAsyncioTestCase):
         await self.store.staff_note(1,ident,'note1','Уточните наличие по телефону.')
         self.assertEqual((await self.store.get(2,ident))['data'],original)
         self.assertEqual(await self.store.pool.fetchval("SELECT count(*) FROM outbox WHERE event='note:note1'"),1)
+
+    def make_ui(self):
+        from types import SimpleNamespace
+        self.ui=BookingUI(self.settings,self.store);self.ui.say=AsyncMock()
+        self.m=SimpleNamespace(chat=SimpleNamespace(type='private'),from_user=SimpleNamespace(id=2),text='',contact=None,answer=AsyncMock(),photo=None)
+        return self.ui,self.m
+
+    async def click(self,action,value='',raw=False):
+        from types import SimpleNamespace
+        from booking_flow import callback
+        data=action if raw else callback(action,await self.store.draft(2),value)
+        await self.ui.callback(SimpleNamespace(message=self.m,from_user=self.m.from_user,data=data,answer=AsyncMock()))
+
+    async def enter(self,text):
+        self.m.text=text;self.m.contact=None;await self.ui.message(self.m)
+
+    async def fill_journey(self):
+        self.make_ui();await self.click('begin',raw=True)
+        self.assertEqual((await self.store.draft(2))['state'],'name')
+        await self.enter('Иван');self.assertEqual((await self.store.draft(2))['state'],'phone')
+        await self.enter('+79812440050');self.assertEqual((await self.store.draft(2))['state'],'guests')
+        await self.click('guest','paid+');await self.click('next','date')
+        self.assertEqual((await self.store.draft(2))['state'],'date')
+        await self.click('day',self.start.date().isoformat());await self.click('slot','13')
+        self.assertEqual((await self.store.draft(2))['state'],'review')
+
     async def test_full_customer_path(self):
+        await self.fill_journey()
+        await self.click('consent')
+        from booking_flow import callback
+        submit=callback('submit',await self.store.draft(2))
+        await self.click(submit,raw=True);await self.click(submit,raw=True)
+        rows=await self.store.listing(2)
+        self.assertEqual(len(rows),1);self.assertEqual(rows[0]['data']['guests'],2)
+        self.assertEqual(rows[0]['data']['cart'],{});self.assertEqual(rows[0]['status'],'pending')
+        await self.store.transition(1,rows[0]['id'],'confirm',staff=True)
+        await self.click('cancel:'+rows[0]['id'],raw=True)
+        self.assertEqual((await self.store.get(2,rows[0]['id']))['status'],'cancelled')
+
+    async def test_review_edit_and_return_requires_consent(self):
+        await self.fill_journey();await self.click('consent')
+        await self.click('edit','guests');await self.click('guest','paid+')
+        await self.click('next','date');d=await self.store.draft(2)
+        self.assertEqual(d['state'],'review');self.assertEqual(d['data']['guests'],3)
+        self.assertFalse(d['data']['consent'])
+        await self.click('edit','name');await self.enter('Пётр')
+        d=await self.store.draft(2);self.assertEqual(d['state'],'review');self.assertEqual(d['data']['name'],'Пётр')
+
+    async def test_stale_counter_does_not_change_current_draft(self):
+        await self.fill_journey();await self.click('edit','guests')
+        from booking_flow import callback
+        old=callback('guest',await self.store.draft(2),'paid+')
+        await self.click(old,raw=True);await self.click(old,raw=True)
+        self.assertEqual((await self.store.draft(2))['data']['guests'],3)
+
+    async def test_wrong_contact_rejected_own_contact_accepted(self):
+        from types import SimpleNamespace
+        self.make_ui();await self.click('begin',raw=True);await self.enter('Иван');await self.click('share')
+        self.m.contact=SimpleNamespace(user_id=3,phone_number='79812440050');await self.ui.message(self.m)
+        self.assertEqual((await self.store.draft(2))['state'],'phone_contact')
+        self.m.contact.user_id=2;await self.ui.message(self.m)
+        self.assertEqual((await self.store.draft(2))['state'],'guests')
+        self.assertEqual(self.m.answer.call_args.kwargs['reply_markup'].remove_keyboard,True)
+
+    async def test_menu_resume_preserves_date_and_counts(self):
+        await self.fill_journey();before=(await self.store.draft(2))['data']
+        await self.click('home',raw=True);await self.click('resume',raw=True)
+        d=await self.store.draft(2)
+        self.assertEqual(d['state'],'review');self.assertEqual(d['data']['start'],before['start'])
+        self.assertEqual(d['data']['guests'],before['guests'])
+
+    async def test_discard_draft_does_not_cancel_booking(self):
+        ident=await self.book();self.make_ui();await self.click('begin',raw=True)
+        await self.click('discardask');await self.click('discard')
+        with self.assertRaises(RuleError):await self.store.draft(2)
+        self.assertEqual((await self.store.get(2,ident))['status'],'pending')
+        await self.click('begin',raw=True)
+        self.assertEqual((await self.store.draft(2))['state'],'name')
+
+    async def test_profile_edit_cancel_and_save_preserve_booking_draft(self):
+        await self.fill_journey();before=(await self.store.draft(2))['data']
+        await self.click('profileedit',raw=True);await self.enter('Новое имя')
+        await self.click('profilecancel',raw=True)
+        self.assertEqual((await self.store.draft(2))['data']['name'],before['name'])
+        await self.click('profileedit',raw=True);await self.enter('Пётр');await self.enter('+79810000000')
+        self.assertEqual((await self.store.profile(2))['name'],'Пётр')
+        d=await self.store.draft(2);self.assertEqual(d['state'],'review')
+        self.assertEqual(d['data']['name'],before['name']);self.assertEqual(d['data']['phone'],before['phone'])
+
+    async def test_changed_date_drops_old_time(self):
+        await self.fill_journey();await self.click('edit','date')
+        await self.click('day',(self.start+timedelta(days=1)).date().isoformat())
+        d=await self.store.draft(2);self.assertEqual(d['state'],'slot');self.assertNotIn('start',d['data'])
+
+    async def test_occupied_slot_preserves_contacts_and_offers_another(self):
+        await self.fill_journey();await self.book(3)
+        await self.click('resume',raw=True)
+        d=await self.store.draft(2);self.assertEqual(d['state'],'slot');self.assertEqual(d['data']['name'],'Иван')
+
+    async def test_each_booking_screen_has_valid_telegram_buttons(self):
+        await self.fill_journey()
+        from booking_ui import kb
+        for call in self.ui.say.call_args_list:
+            text=call.args[1];rows=call.args[2]
+            markup=kb(rows)
+            self.assertLessEqual(len(text),1000)
+            self.assertTrue(any(button.callback_data=='home' for row in markup.inline_keyboard for button in row))
+            for row in markup.inline_keyboard:
+                for button in row:
+                    if button.callback_data:self.assertLessEqual(len(button.callback_data.encode()),64)
+
+    async def test_counter_edits_caption_without_reuploading_photo(self):
         from types import SimpleNamespace
         ui=BookingUI(self.settings,self.store)
-        m=SimpleNamespace(chat=SimpleNamespace(type='private'),from_user=SimpleNamespace(id=2),answer=AsyncMock(),answer_photo=AsyncMock(),photo=None,edit_text=AsyncMock(),edit_caption=AsyncMock(),text='')
-        def call(data):return SimpleNamespace(message=m,from_user=SimpleNamespace(id=2),data=data,answer=AsyncMock())
-        await ui.callback(call('begin'));d=await self.store.draft(2);t=d['token']
-        await ui.callback(call(f'day:{t}:'+self.start.date().isoformat()));await ui.callback(call(f'slot:{t}:13'))
-        await ui.callback(call(f'guest:{t}:paid+'));await ui.callback(call(f'next:{t}:name'))
-        m.text='Иван';await ui.message(m);m.text='+79812440050';await ui.message(m)
-        await ui.callback(call(f'product:{t}:oak'));await ui.callback(call(f'qty:{t}:1'));d=await self.store.draft(2,t);await ui.callback(call(f'add:{t}:'+d['data']['item_nonce']))
-        await ui.callback(call(f'review:{t}:'));d=await self.store.draft(2,t);self.assertFalse(d['data']['consent'])
-        await ui.callback(call(f'consent:{t}:'));await ui.callback(call(f'submit:{t}:'))
-        rows=await self.store.listing(2);self.assertEqual(len(rows),1);self.assertEqual(rows[0]['data']['guests'],2)
-        self.assertEqual(rows[0]['data']['cart'],{'oak':1});self.assertEqual(rows[0]['status'],'pending')
-        await self.store.transition(1,rows[0]['id'],'confirm',staff=True);await ui.callback(call('cancel:'+rows[0]['id']));self.assertEqual((await self.store.get(2,rows[0]['id']))['status'],'cancelled')
-    async def test_ui_product_changes_only_after_add(self):
-        t=await self.ready();d=await self.store.draft(2,t);await self.store.save(2,d,'services',d['data']);ui=BookingUI(self.settings,self.store)
-        from types import SimpleNamespace
-        message=SimpleNamespace(chat=SimpleNamespace(type='private'),answer=AsyncMock(),answer_photo=AsyncMock(),photo=None,edit_text=AsyncMock())
-        def call(data):return SimpleNamespace(message=message,from_user=SimpleNamespace(id=2),data=data,answer=AsyncMock())
-        await ui.callback(call(f'product:{t}:birch'));await ui.callback(call(f'qty:{t}:1'));d=await self.store.draft(2,t);self.assertNotIn('birch',d['data']['cart'])
-        await ui.callback(call(f'add:{t}:'+d['data']['item_nonce']));self.assertEqual((await self.store.draft(2,t))['data']['cart']['birch'],1)
+        m=SimpleNamespace(photo=True,edit_caption=AsyncMock(),edit_media=AsyncMock())
+        await ui.say(m,'Гостей: 3',[[('Главное меню','home')]],photo='guests',edit='caption')
+        m.edit_caption.assert_awaited_once();m.edit_media.assert_not_awaited()
+
+    async def test_admin_filters_pending_separately_from_confirmed(self):
+        first=await self.book(2);second=await self.book(3,1)
+        await self.store.transition(1,first,'confirm',staff=True)
+        rows=await self.store.listing(1,staff=True,status_filter='pending')
+        self.assertEqual([r['id'] for r in rows],[second])
+
+    async def test_no_extras_in_customer_or_admin_navigation(self):
+        await self.fill_journey()
+        labels=str(self.ui.say.call_args)
+        self.assertNotIn('Дополнительные услуги',labels)
+        client=TestClient(TestServer(make_app(self.store,self.settings,secure=False)));await client.start_server()
+        try:
+            session=await self.store.login(await self.store.login_token(1));client.session.cookie_jar.update_cookies({'pihta_session':session})
+            r=await client.get('/catalog');text=await r.text()
+            self.assertNotIn('Снять с продажи',text);self.assertIn('Тарифы и праздничные даты',text)
+            r=await client.post('/catalog/oak',data={});self.assertEqual(r.status,404)
+        finally:await client.close()
 
 
-class BookingOnlyUI(unittest.IsolatedAsyncioTestCase):
-    def setUp(self):
-        from types import SimpleNamespace
-        self.settings=load()
-        self.store=SimpleNamespace(pricing=AsyncMock(return_value=({},{})),save=AsyncMock())
-        self.ui=BookingUI(self.settings,self.store)
-        self.ui.say=AsyncMock()
-        self.message=SimpleNamespace(chat=SimpleNamespace(type='private'),from_user=SimpleNamespace(id=2),text='+79812440050')
+class FlowPolicies(unittest.TestCase):
+    def test_counts_boundaries_and_children(self):
+        from booking_flow import change_guests
+        self.assertEqual(change_guests(dict(guests=4,children=1),'kid',1)['guests'],5)
+        for data,category,delta in [(dict(guests=8,children=1),'paid',1),(dict(guests=1,children=0),'paid',-1),(dict(guests=2,children=0),'kid',-1)]:
+            with self.assertRaises(RuleError):change_guests(data,category,delta)
+    def test_callback_limit(self):
+        from booking_flow import callback
+        self.assertLessEqual(len(callback('resume_step',dict(token='a'*12,revision=999999), '2026-12-31').encode()),64)
 
-    async def test_phone_goes_directly_to_review(self):
-        d={'state':'phone','token':'abc','data':{}}
-        self.store.draft=AsyncMock(return_value=d)
-        self.ui.render=AsyncMock()
-        await self.ui.message(self.message)
-        self.assertEqual(self.store.save.call_args.args[2],'review')
 
-    async def test_old_product_buttons_are_blocked(self):
-        from types import SimpleNamespace
-        self.store.draft=AsyncMock(return_value={'state':'services','data':{},'token':'abc'})
-        for action in ('product:abc:oak','qty:abc:1','add:abc:nonce','back:abc:services'):
-            await self.ui.callback(SimpleNamespace(message=self.message,from_user=SimpleNamespace(id=2),data=action,answer=AsyncMock()))
-        self.store.save.assert_not_awaited()
-        self.assertEqual(self.ui.say.await_count,4)
-
-    async def test_old_cart_is_removed_and_requires_consent(self):
-        from booking_ui import EXTRAS_ENABLED
-        self.assertFalse(EXTRAS_ENABLED)
-        d={'state':'product','token':'abc','data':dict(start='2026-11-01T13:00:00+03:00',guests=2,children=0,hours=2,name='Иван',phone='+79812440050',cart={'oak':2},consent=True)}
-        await self.ui.render(self.message,2,d)
-        self.assertEqual(d['data']['cart'],{})
-        self.assertFalse(d['data']['consent'])
-        self.assertEqual(self.store.save.call_args.args[2],'review')
-        labels=str(self.ui.say.call_args.args[2])
-        self.assertNotIn('Изменить услуги',labels)
-
-    async def test_prices_hide_product_catalog(self):
-        await self.ui.info(self.message,'Цены и услуги')
-        text=self.ui.say.call_args.args[1]
-        self.assertNotIn('Дубовый',text)
-        self.assertIn('временно недоступен',text)
+class ExtensionContracts(unittest.TestCase):
+    def test_no_optional_features_in_first_release(self):
+        from bot_features import configured_features
+        features=configured_features(None,None)
+        self.assertEqual(features.menu(),[])
+        self.assertEqual([c.command for c in features.commands()],['start','book','bookings','help'])
+    def test_duplicate_names_and_commands_rejected(self):
+        from bot_features import Feature,Features
+        from aiogram import Router
+        from aiogram.types import BotCommand
+        with self.assertRaises(ValueError):Features([Feature('future','Новый раздел',Router()),Feature('future','Ещё',Router())])
+        with self.assertRaises(ValueError):Features([Feature('future','Новый раздел',Router(),(BotCommand(command='book',description='Конфликт'),))])
+    def test_separate_module_registers_without_changing_core(self):
+        from bot_features import Feature,Features
+        from aiogram import Router,Dispatcher
+        core=Router();extension=Router();features=Features([Feature('future','Новый раздел',extension)])
+        dp=Dispatcher();features.mount(dp,core)
+        self.assertEqual(dp.sub_routers,[extension,core]);self.assertEqual(features.menu(),[[('Новый раздел','feature:future:home')]])

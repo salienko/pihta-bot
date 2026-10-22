@@ -1,4 +1,3 @@
-from settings import EXTRAS_ENABLED
 """Booking policies. Money is integer kopecks; all dates are Moscow-aware."""
 from datetime import datetime, timedelta
 from domain import TZ, RuleError, horizon, participants, clean_name, normalize_phone, rub
@@ -49,20 +48,27 @@ def can_cancel(status, start, clock):
 def card(row, personal=True):
     d,q=row['data'],row['estimate']
     start=row['starts_at'].astimezone(TZ);end=row['ends_at'].astimezone(TZ)
-    lines=[f"Бронь № {row['id']}",LABELS[row['status']],f'{start:%d.%m.%Y %H:%M}–{end:%H:%M}',
-           f"Кол-во гостей: {d['guests']}",f"Гости с 7 лет: {d['guests']-d['children']}",
-           f"Дети до 6 лет включительно: {d['children']}",f"Простыни включены: {d['guests']} шт.",
-           f"Аренда: {rub(q['rent'])}",f"Доплата за гостей: {rub(q['guest_extra'])}"]
+    icons={'pending':'⏳','confirmed':'✅','cancelled':'✕','rejected':'✕','expired':'✕','completed':'✓','draft':'✏️'}
+    lines=[f"Бронь № {row['id']}",f"{icons[row['status']]} {LABELS[row['status']]}",'',f'📅 {start:%d.%m.%Y} · {start:%H:%M}–{end:%H:%M}',
+           'Время московское','',f"Кол-во гостей: {d['guests']}",f"Гости от 7 лет: {d['guests']-d['children']}",
+           f"Дети до 6 лет включительно: {d['children']}",f"Простыни включены: {d['guests']} шт.",'',f"Аренда: {rub(q['rent'])}"]
+    if q['guest_extra']:lines.append(f"Доплата за гостей: {rub(q['guest_extra'])}")
+    # Historical snapshots can contain old goods; display them without enabling orders.
     lines += [f"{i['name']} × {i['quantity']} — {rub(i['total'])}" for i in q['items']]
-    if EXTRAS_ENABLED and not q['items']:lines.append('Дополнительные услуги не выбраны.')
-    lines += [f"Итого по брони: {rub(q['total'])}",f"Оплачено: {rub(row.get('paid',0))}"]
+    lines += [f"Итого по брони: {rub(q['total'])}"]
     actual=row.get('actual_total');total=actual if actual is not None else q['total']
-    if actual is not None:lines.append('Фактический расчёт отдельно: '+rub(actual))
-    lines.append('Остаток: '+rub(max(0,total-row.get('paid',0))))
-    if row.get('paid',0)>total:lines.append('Переплата: '+rub(row['paid']-total)+' — обратитесь к администратору.')
-    if row.get('reason'):lines.append('Причина: '+row['reason'])
-    if row.get('no_show'):lines.append('Администратор отметил неявку.')
-    if row['status']=='confirmed' and start<=datetime.now(TZ)<end:lines.append('Сеанс идёт. Окончание по исходной брони.')
-    if personal:lines += [f"Имя: {d['name']}",f"Телефон: {d['phone']}"]
-    lines += ['После отправки бронь не редактируется.','Оплата на месте до начала сеанса.']
+    if actual is not None:lines.append('Фактический расчёт: '+rub(actual))
+    paid=row.get('paid',0)
+    if paid:lines.append('Оплачено: '+rub(paid))
+    if row['status'] in ('cancelled','rejected','expired'):
+        if paid:lines.append('Расчёт и возможный возврат — через администратора.')
+    else:
+        lines.append(('К оплате: ' if not paid else 'Остаток: ')+rub(max(0,total-paid)))
+        if paid>total:lines.append('Переплата: '+rub(paid-total)+' · обратитесь к администратору.')
+    if row.get('reason'):lines+=['','Причина: '+row['reason']]
+    if row.get('no_show'):lines+=['','Администратор отметил неявку.']
+    if row['status']=='confirmed' and start<=datetime.now(TZ)<end:lines+=['','Сеанс идёт. Окончание по брони.']
+    if personal:lines += ['',f"👤 {d['name']}",f"📱 {d['phone']}"]
+    if row['status'] in ('pending','confirmed'):
+        lines += ['','После отправки бронь не редактируется.','Оплата на месте до начала.']
     return '\n'.join(lines)

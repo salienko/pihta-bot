@@ -1,231 +1,434 @@
-"""Native Telegram conversation. Persistent drafts; no Mini App."""
-from settings import EXTRAS_ENABLED
-from datetime import datetime,date,timedelta
+"""Native Telegram rental booking: one journey, short screens, durable drafts."""
+import asyncio
+import calendar
+from collections import defaultdict
+from datetime import date, datetime, timedelta
 from pathlib import Path
-import secrets
 from aiogram import Router
-from aiogram.types import ReplyKeyboardMarkup,KeyboardButton,InlineKeyboardMarkup,InlineKeyboardButton,FSInputFile
+from aiogram.types import (ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton,
+                           InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, InputMediaPhoto)
 from aiogram.exceptions import TelegramBadRequest
-from booking_domain import TZ,SLOTS,LABELS,RuleError,estimate,card,can_cancel,validate_start,clean_name,normalize_phone,horizon,rub
+from booking_domain import (TZ, SLOTS, LABELS, RuleError, estimate, card, can_cancel,
+                            validate_start, clean_name, normalize_phone, horizon, rub)
+from booking_flow import VERSION, STEPS, TITLES, prepare, require, first_missing, change_guests, callback
 
-MENU=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=a),KeyboardButton(text=b)] for a,b in [('Забронировать','Цены'),('Мои бронирования','Правила'),('Контакты','Помощь')]],resize_keyboard=True,is_persistent=True)
-def kb(rows):return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t,**({'url':v} if v.startswith('https://') else {'callback_data':v})) for t,v in row] for row in rows])
-def nav():return [[('Главное меню','home')]]
+
+def kb(rows):
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=text, **({'url': value} if value.startswith('https://') else {'callback_data': value}))
+        for text, value in row] for row in rows])
+
+
+def nav(): return [[('🏠 Главное меню', 'home')]]
+
 
 class BookingUI:
-    def __init__(self,settings,store):
-        self.settings,self.store=settings,store;self.catalog={i['code']:i for i in settings.content['services']}
-        self.router=Router();self.router.message.register(self.message);self.router.callback_query.register(self.callback)
+    def __init__(self, settings, store, features=None):
+        self.settings, self.store = settings, store
+        self.features=features
+        self.router = Router()
+        self.router.message.register(self.message)
+        self.router.callback_query.register(self.callback)
+        self.locks = defaultdict(asyncio.Lock)
 
-    async def say(self,m,text,rows=None,photo=None,edit=False):
-        markup=kb(rows if rows is not None else nav())
-        if edit and len(text)<=1000:
+    async def say(self, m, text, rows=None, photo=None, edit=False):
+        markup = kb(rows if rows is not None else nav())
+        file = Path(__file__).with_name('assets') / f'{photo}.jpg' if photo else None
+        if edit and len(text) <= 1000:
             try:
-                if m.photo:await m.edit_caption(caption=text,reply_markup=markup)
-                else:await m.edit_text(text,reply_markup=markup)
+                if m.photo and edit=='caption':
+                    await m.edit_caption(caption=text,reply_markup=markup)
+                elif m.photo and file and file.exists():
+                    await m.edit_media(InputMediaPhoto(media=FSInputFile(file), caption=text), reply_markup=markup)
+                elif m.photo:
+                    await m.edit_caption(caption=text, reply_markup=markup)
+                elif not file:
+                    await m.edit_text(text, reply_markup=markup)
+                else:
+                    raise TelegramBadRequest(method=None, message='message to edit not found')
                 return
-            except TelegramBadRequest as e:
-                if 'message is not modified' in str(e):return
-                if not any(s in str(e).lower() for s in ('message to edit not found',"message can't be edited")):raise
-        file=Path(__file__).with_name('assets')/f'{photo}.jpg' if photo else None
-        if file and file.exists():
-            if len(text)<=1000:await m.answer_photo(FSInputFile(file),caption=text,reply_markup=markup);return
-            await m.answer_photo(FSInputFile(file))
-        for pos in range(0,len(text),3500):await m.answer(text[pos:pos+3500],reply_markup=markup if pos+3500>=len(text) else None)
+            except TelegramBadRequest as error:
+                message = str(error).lower()
+                if 'message is not modified' in message: return
+                if not any(s in message for s in ('message to edit not found', "message can't be edited", 'message is too long')):
+                    raise
+        if file and file.exists() and len(text) <= 1000:
+            await m.answer_photo(FSInputFile(file), caption=text, reply_markup=markup)
+            return
+        for pos in range(0, len(text), 3500):
+            await m.answer(text[pos:pos+3500], reply_markup=markup if pos+3500 >= len(text) else None)
 
-    async def home(self,m):await m.answer('Пихта · баня на дровах\nВыберите действие в нижнем меню.',reply_markup=MENU)
-    async def info(self,m,section):
-        c=self.settings.content
-        if section=='Контакты':await self.say(m,c['name']+'\n'+c['phone']+'\nПосёлок Приладожское',[[('Маршрут · Яндекс Карты',c['map_url'])],[('Позвонить / связаться','contact')]]+nav(),photo='home');return
-        if section=='Правила':await self.say(m,self.settings.rules);return
-        if section in ('Цены','Цены и услуги'):
-            text='Аренда на 2 часа:\nПН–ПТ до 19:00 — 5000 ₽\nПН–ПТ с 19:00 и выходные — 6000 ₽\nПраздники, кроме Нового года — 6500 ₽\nСледующий час по согласованию: 2300 / 2800 / 3000 ₽.\nСвыше 4 гостей с 7 лет: 250 ₽/час за гостя. Максимум 8 вместе с детьми.\nПростыня на каждого гостя включена; полотенца платные.\n\n'+('\n'.join(f"{i['name']} — {rub(i['price'])}/{i.get('unit','шт.')}" for i in self.catalog.values()) if EXTRAS_ENABLED else 'Заказ дополнительных услуг в боте временно недоступен.')
-            await self.say(m,text,[[('Забронировать','begin')],[('Связаться с администратором','contact')]]+nav(),photo='home');return
-        await self.say(m,'Черновик можно менять. Отправленная заявка занимает время и ждёт подтверждения. После отправки изменения невозможны — только отмена и новая бронь.\nОплата полностью на месте до начала.\nКонтакт администратора: '+c['phone'],nav())
+    async def unfinished(self, actor):
+        try: return await self.store.draft(actor)
+        except RuleError: return None
 
-    async def start(self,m,actor):
-        token=await self.store.begin(actor);d=await self.store.draft(actor,token)
-        if d['state'].startswith('profile_'):
-            await self.store.save(actor,d,'date',d['data']);d=await self.store.draft(actor,token)
-        await self.render(m,actor,d)
+    async def leave_contact(self, m, actor):
+        d = await self.unfinished(actor)
+        if d and d['state'] in ('phone_contact', 'profile_contact'):
+            await self.store.save(actor, d, 'phone' if d['state']=='phone_contact' else 'profile_phone', d['data'])
+            await m.answer('Выбор номера закрыт.', reply_markup=ReplyKeyboardRemove())
 
-    async def render(self,m,actor,d,edit=False):
-        self.catalog,holidays=await self.store.pricing()
-        state=d['state'];data=d['data'];
-        if not EXTRAS_ENABLED:
-            changed=bool(data.get('cart')) or state in ('services','product')
-            data['cart']={}
-            if state in ('services','product'):state='review'
-            if changed:
-                data['consent']=False
-                if state!='review':
-                    await self.store.save(actor,d,state,data)
-                    d=await self.store.draft(actor,d['token'])
-        t=d['token'];b=lambda a,v='':f'{a}:{t}:{v}'
-        if state=='date':
-            today=datetime.now(TZ).date();offset=data.get('offset',0);days=(horizon(today)-today).days+1
-            rows=[[((today+timedelta(days=i)).strftime('%d.%m.%Y'),b('day',(today+timedelta(days=i)).isoformat()))] for i in range(offset,min(days,offset+7))]
-            page=[]
-            if offset:page.append(('← Раньше',b('page',str(max(0,offset-7)))))
-            if offset+7<days:page.append(('Позже →',b('page',str(offset+7))))
-            if page:rows.append(page)
-            await self.say(m,'Выберите дату. Не более двух активных броней на разные даты. Запись минимум за час, максимум на два месяца.',rows+nav(),photo='date',edit=edit)
+    async def home(self, m, actor=None, edit=False):
+        actor = actor or m.from_user.id
+        await self.leave_contact(m, actor)
+        await self.cancel_profile(actor)
+        d = await self.unfinished(actor)
+        rows = [[('📅 Забронировать', 'begin')], [('📋 Мои бронирования', 'list:0:0')],
+                [('💰 Цены', 'info:Цены'), ('📖 Правила', 'info:Правила')],
+                [('📍 Контакты', 'info:Контакты'), ('❓ Помощь', 'info:Помощь')]]
+        if self.features:rows.extend(self.features.menu())
+        if d:
+            rows.insert(0, [('✏️ Продолжить бронирование', 'resume')])
+        if actor in self.settings.admin_ids: rows.append([('🔐 Панель администратора', 'staffweb')])
+        await self.say(m, 'ПИХТА · баня на дровах\n\nБаня целиком для вашей компании.\nВыберите действие.', rows, photo='home', edit=edit)
+
+    async def info(self, m, actor, section, back=None, edit=False):
+        c = self.settings.content
+        rows = []
+        if back: rows.append([('← К бронированию', back)])
+        if section == 'Контакты':
+            text = f'📍 Как нас найти\n\n{c["name"]}\nПосёлок Приладожское\n\n☎️ {c["phone"]}\nНестандартное время — по согласованию с администратором.'
+            rows = [[('📍 Построить маршрут', c['map_url'])]] + rows
+        elif section == 'Правила':
+            text = ('📖 Правила бронирования\n\nДо 8 гостей вместе с детьми.\nДети до 6 лет включительно — без доплаты.\nПростыня на каждого гостя включена.\n\n'
+                    'Без предоплаты. Расчёт на месте до начала.\n\nЗаявка занимает время и ждёт решения администратора.\n'
+                    'Ожидающую заявку можно отменить в любое время. Подтверждённую — не позднее чем за 24 часа. Позже — через администратора.\n\n'
+                    'Отправленную бронь нельзя изменить: отмените её и создайте новую. Опоздание не продлевает сеанс.\n\n'
+                    'Не более двух действующих броней на разные даты. Запись за час — два месяца до сеанса.')
+            rows.insert(0,[('📄 Полные правила','rulesfull')])
+        elif section in ('Цены', 'Цены и услуги'):
+            text = ('💰 Аренда бани · 2 часа\n\nПн–пт до 19:00 — 5 000 ₽\nС 19:00 и в выходные — 6 000 ₽\nПраздничные даты — 6 500 ₽*\n\n'
+                    'Включены 4 гостя от 7 лет.\nЗа каждого следующего — 250 ₽/час.\nДети до 6 лет включительно — бесплатно.\n\n'
+                    'Точная сумма будет перед отправкой.\n*Особые даты и нестандартная длительность — через администратора.')
+            rows = [[('📅 Забронировать', 'begin')]] + rows
+        else:
+            text = ('❓ Как записаться\n\nИмя → телефон → гости → дата → время.\nПроверьте карточку и отправьте её администратору.\n\n'
+                    'Черновик сохраняется: можно вернуться позже.\nВ «Моих бронированиях» — статус, детали и отмена.\n\n'
+                    'Нужно другое время или помощь? Свяжитесь с администратором.')
+            rows.append([('☎️ Администратор', 'contact')])
+        await self.say(m, text, rows + nav(), photo='home', edit=edit)
+
+    async def start(self, m, actor, edit=False):
+        await self.leave_contact(m, actor)
+        d = await self.unfinished(actor)
+        if d:
+            await self.say(m, '✏️ У вас есть незавершённое бронирование.\n\nПродолжить с сохранённого шага или начать заново?',
+                           [[('Продолжить', 'resume')], [('Начать заново', callback('resetask', d))]] + nav(), edit=edit)
+            return
+        if len(await self.store.listing(actor)) >= 2:
+            await self.say(m, 'У вас уже две действующие брони.\nОткройте их, чтобы посмотреть детали или отменить.', [[('📋 Мои бронирования', 'list:0:0')]]+nav(), edit=edit)
+            return
+        token = await self.store.begin(actor)
+        await self.render(m, actor, await self.store.draft(actor, token), edit=edit)
+
+    async def render(self, m, actor, d, edit=False):
+        state, data = prepare(d['state'], d['data'])
+        if state != d['state'] or data != d['data']:
+            await self.store.save(actor, d, state, data)
+            d = await self.store.draft(actor, d['token'])
+        state, data = d['state'], d['data']
+        if state in ('phone_contact', 'profile_contact'):
+            state = 'phone' if state=='phone_contact' else 'profile_phone'
+            await self.store.save(actor,d,state,data)
+            await m.answer('Можно ввести номер вручную.',reply_markup=ReplyKeyboardRemove())
+            d=await self.store.draft(actor,d['token'])
+        b = lambda action, value='': callback(action, d, value)
+        if state.startswith('profile_'):
+            key='name' if state=='profile_name' else 'phone'
+            text='👤 Мои данные\n\n'+('Введите новое имя.' if key=='name' else 'Введите телефон для будущих бронирований.\nНапример: +7 981 244-00-50')
+            rows=[]
+            if key=='phone':rows.append([('📱 Поделиться моим номером',b('share','profile'))])
+            rows.append([('← Отменить изменение','profilecancel')])
+            await self.say(m,text,rows+nav(),edit=edit)
+            return
+        try: require(data, state)
+        except RuleError:
+            state=first_missing(data)
+            data['consent']=False
+            await self.store.save(actor,d,state,data)
+            d=await self.store.draft(actor,d['token'])
+            b=lambda action,value='':callback(action,d,value)
+        step=f'{STEPS.index(state)+1} из 6 · {TITLES[state]}'
+        heading='Ваше бронирование\n'+step+'\n\n'
+        footer=[[('✕ Отменить оформление',b('discardask'))]]+nav()
+        if state=='name':
+            rows=[]
+            if data.get('name'):rows.append([(f'✓ {data["name"]}',b('keep','name'))])
+            await self.say(m,heading+'Как к вам обращаться?\nНапишите имя.',rows+footer,photo='booking',edit=edit)
+        elif state=='phone':
+            rows=[]
+            if data.get('phone'):rows.append([(f'✓ {data["phone"]}',b('keep','phone'))])
+            rows += [[('📱 Поделиться моим номером',b('share'))], [('← Имя',b('back','name'))]]
+            await self.say(m,heading+'Укажите телефон для связи.\n\nМожно поделиться номером Telegram с вашего разрешения или написать другой.\nНапример: +7 981 244-00-50',rows+footer,photo='booking',edit=edit)
+        elif state=='guests':
+            paid=data['guests']-data['children'];kids=data['children']
+            def count_button(category,delta,enabled):return ('−' if delta<0 else '+',b('guest',category+('+' if delta>0 else '-')) if enabled else b('limit','min' if delta<0 else 'max'))
+            rows=[[count_button('paid',-1,paid>0 and data['guests']>1),(f'От 7 лет: {paid}',b('noop')),count_button('paid',1,data['guests']<8)],
+                  [count_button('kid',-1,kids>0 and data['guests']>1),(f'До 6 лет: {kids}',b('noop')),count_button('kid',1,data['guests']<8)],
+                  [('Далее · дата →',b('next','date'))],[('← Телефон',b('back','phone'))]]
+            text=f'Кол-во гостей: {data["guests"]}\n\nГости старше 7 лет: {paid}\nВ расчёт входят гости от 7 лет включительно.\n\nДети до 6 лет включительно: {kids}\n\nПростыни включены: {data["guests"]} шт.'
+            await self.say(m,heading+text,rows+footer,photo='guests',edit=edit)
+        elif state=='date':
+            today=datetime.now(TZ).date();last=horizon(today)
+            month=date.fromisoformat(data.get('month',today.replace(day=1).isoformat()))
+            if month<today.replace(day=1) or month>last.replace(day=1):month=today.replace(day=1)
+            months=('Январь','Февраль','Март','Апрель','Май','Июнь','Июль','Август','Сентябрь','Октябрь','Ноябрь','Декабрь')
+            rows=[[(f'{months[month.month-1]} {month.year}',b('noop'))],[(day,b('noop')) for day in ('Пн','Вт','Ср','Чт','Пт','Сб','Вс')]]
+            active=await self.store.listing(actor)
+            occupied={r['starts_at'].astimezone(TZ).date() for r in active}
+            for week in calendar.Calendar().monthdatescalendar(month.year,month.month):
+                rows.append([(str(day.day),b('day',day.isoformat())) if day.month==month.month and today<=day<=last and day not in occupied else ('·',b('noop')) for day in week])
+            paging=[]
+            for delta,label in ((-1,'‹ Месяц'),(1,'Месяц ›')):
+                target=(month-timedelta(days=1)).replace(day=1) if delta<0 else (month+timedelta(days=32)).replace(day=1)
+                if today.replace(day=1)<=target<=last.replace(day=1):paging.append((label,b('month',target.isoformat())))
+            if paging:rows.append(paging)
+            rows += [[('← Гости',b('back','guests'))]]
+            await self.say(m,heading+'Выберите день в календаре.\nВремя — по Москве.\nОдна бронь на дату, не более двух действующих.',rows+footer,photo='date',edit=edit)
         elif state=='slot':
             day=date.fromisoformat(data['day']);rows=[]
             for hour in SLOTS:
                 start=datetime.combine(day,datetime.min.time(),TZ)+timedelta(hours=hour)
-                try:available=await self.store.free(start)
+                try: available=await self.store.free(start)
                 except RuleError:continue
-                if available:rows.append([(f'{hour:02}:00–{(hour+2)%24:02}:00',b('slot',str(hour)))])
-            await self.say(m,'Свободные двухчасовые сеансы на '+day.strftime('%d.%m.%Y') if rows else 'Свободных сеансов на эту дату нет.',rows+[[('Нужны 3–5 часов · к менеджеру','contact')],[('Назад к датам',b('back','date'))]]+nav(),photo='time',edit=edit)
-        elif state=='guests':
-            paid=data['guests']-data['children'];kids=data['children']
-            text=f'Количество гостей: {data["guests"]} из 8\nС 7 лет: {paid}\nДети до 6 лет включительно: {kids}\nПростыни включены: {data["guests"]} шт.\nПолотенца — платная аренда.'
-            rows=[[('−',b('guest','paid-')),(f'С 7 лет: {paid}',b('noop')),('+',b('guest','paid+'))],[('−',b('guest','kid-')),(f'До 6 вкл.: {kids}',b('noop')),('+',b('guest','kid+'))],[('Далее',b('next','name'))],[('Назад ко времени',b('back','slot'))]]
-            await self.say(m,text,rows+nav(),photo='guests',edit=edit)
-        elif state in ('name','phone'):
-            text='Отправьте имя сообщением.' if state=='name' else 'Отправьте телефон сообщением в формате +7XXXXXXXXXX.'
-            key='name' if state=='name' else 'phone';rows=[]
-            if data.get(key):rows.append([(f'Оставить: {data[key]}',b('keep',key))])
-            await self.say(m,text,rows+[[('Назад',b('back','guests' if state=='name' else 'name'))]]+nav(),photo='booking')
-        elif state=='services':
-            start=datetime.fromisoformat(data['start']);text=f'Ваше бронирование\n{start:%d.%m.%Y %H:%M} · 2 часа\nКол-во гостей: {data["guests"]}\nПростыни включены: {data["guests"]} шт.\nВыберите дополнительные услуги или продолжите без них.'
-            rows=[[(i['name'],b('product',code))] for code,i in self.catalog.items() if i.get('available',True)]
-            rows += [[('Ваш заказ · итог',b('review'))],[('Изменить контакты',b('back','name'))]]
-            await self.say(m,text,rows+nav(),photo='extras',edit=edit)
-        elif state=='product':
-            code=data['product'];item=self.catalog[code];qty=data['quantity'];unit=item.get('unit','шт.')
-            text=f"{item['name']}\nЦена: {rub(item['price'])}/{unit}\nКол-во: {qty} {unit}\nСумма: {rub(item['price']*qty)}"
-            if code=='sheet':text+='\nОдна простыня на каждого гостя уже включена.'
-            if code in ('eucalyptus','lavender'):text+='\nМаксимум одно аромапарение. Выбор заменит другой аромат в черновике.'
-            await self.say(m,text,[[('−',b('qty','-1')),(f'{qty} {unit}',b('noop')),('+',b('qty','1'))],[('Добавить в заказ' if qty else 'Убрать из заказа',b('add',data['item_nonce']))],[('Назад к услугам',b('back','services'))]]+nav(),photo=code,edit=edit)
+                if available:rows.append([(f'🕒 {hour:02}:00–{(hour+2)%24:02}:00',b('slot',str(hour)))])
+            text=f'{day:%d.%m.%Y}\n\n'+('Выберите удобное время · 2 часа.' if rows else 'Свободных сеансов нет.\nВыберите другую дату.')
+            rows += [[('↻ Обновить время',b('refresh'))],[('← Другая дата',b('back','date'))],[('☎️ Другое время','contact')]]
+            await self.say(m,heading+text,rows+footer,photo='time',edit=edit)
         elif state=='review':
-            q=estimate(data,self.catalog,holidays)
+            catalog,holidays=await self.store.pricing()
+            try:
+                validate_start(datetime.fromisoformat(data['start']),datetime.now(TZ))
+                if not await self.store.free(datetime.fromisoformat(data['start'])):raise RuleError('Время уже занято. Выберите другое.')
+                q=estimate(data,catalog,holidays)
+            except RuleError as error:
+                await self.store.save(actor,d,'slot',dict(data,consent=False))
+                d=await self.store.draft(actor,d['token'])
+                await self.say(m,str(error),[[('🕒 Выбрать время',callback('resume_step',d))],[('☎️ Администратор','contact')]]+nav(),edit=edit)
+                return
             if data.get('quote')!=q or data.get('rules_hash')!=self.settings.rules_hash:data['consent']=False
-            data.update(quote=q,rules_hash=self.settings.rules_hash);await self.store.save(actor,d,'review',data)
+            data.update(quote=q,rules_hash=self.settings.rules_hash,cart={})
+            await self.store.save(actor,d,'review',data)
+            d=await self.store.draft(actor,d['token']);b=lambda action,value='':callback(action,d,value)
             start=datetime.fromisoformat(data['start']);end=start+timedelta(hours=2)
-            row=dict(id='черновик',data=data,estimate=q,starts_at=start,ends_at=end,status='draft',paid=0)
-            text=card(row)+'\n\nПока ждёт подтверждения — отмена в любое время. После подтверждения — минимум за 24 часа. Без подтверждения заявка автоматически отменится по окончании сеанса.'
+            text=(f'Ваше бронирование\n\n📅 {start:%d.%m.%Y} · {start:%H:%M}–{end:%H:%M}\nВремя московское\n'
+                  f'👤 {data["name"]}\n📱 {data["phone"]}\n\nГостей: {data["guests"]}\nОт 7 лет: {data["guests"]-data["children"]} · дети до 6 лет: {data["children"]}\n'
+                  f'Простыни включены: {data["guests"]} шт.\n\nАренда: {rub(q["rent"])}\n')
+            if q['guest_extra']:text+=f'Доплата за гостей: {rub(q["guest_extra"])}\n'
+            text+=f'Итого: {rub(q["total"])}\n\nОплата на месте · без предоплаты.\nЗаявку подтвердит администратор.'
             if start-datetime.now(TZ)<timedelta(hours=24):text+='\nДо начала менее суток: после подтверждения отмена только через администратора.'
-            rows=[[('Прочитать правила','info:Правила')],[(('☑' if data.get('consent') else '□')+' С правилами ознакомлен и согласен',b('consent'))]]
-            if data.get('consent'):rows.append([('Отправить на подтверждение',b('submit'))])
-            if EXTRAS_ENABLED:rows.append([('Изменить услуги в черновике',b('back','services'))])
-            rows += [[('Изменить контакты',b('back','name'))],[('Изменить дату и гостей',b('back','date'))]]
-            await self.say(m,text,rows+nav(),photo='booking')
+            rows=[[(('☑' if data.get('consent') else '☐')+' Принимаю правила',b('consent')),('📖 Правила',b('rules'))]]
+            if data.get('consent'):rows.insert(0,[('✅ Подтвердить бронирование',b('submit'))])
+            rows.append([('✏️ Изменить данные',b('editmenu'))])
+            await self.say(m,text,rows+footer,photo='booking',edit=edit)
 
-    async def listing(self,m,actor,history=False,offset=0):
+    async def listing(self,m,actor,history=False,offset=0,edit=False):
+        await self.leave_contact(m,actor)
+        await self.cancel_profile(actor)
         rows=await self.store.listing(actor,history,offset=offset);buttons=[]
-        for r in rows[:20]:buttons.append([(f"{r['starts_at'].astimezone(TZ):%d.%m %H:%M} · {LABELS[r['status']]}",'open:'+r['id'])])
-        if len(rows)>20:buttons.append([('Далее',f'list:{int(history)}:{offset+20}')])
+        for r in rows[:20]:buttons.append([(f'{r["starts_at"].astimezone(TZ):%d.%m · %H:%M} · {LABELS[r["status"]]}','open:'+r['id'])])
+        if len(rows)>20:buttons.append([('Далее →',f'list:{int(history)}:{offset+20}')])
         if offset:buttons.append([('← Назад',f'list:{int(history)}:{max(0,offset-20)}')])
         if history and not offset:
             for r in await self.store.legacy(actor):buttons.append([('Прежняя заявка № '+r['id'],'legacy:'+r['id'])])
-        buttons += [[('Предстоящие','list:0:0'),('История','list:1:0')],[('Мои данные','profile')],[('Забронировать','begin')]]
-        await self.say(m,('История' if history else 'Мои бронирования')+('\nЗаписей нет.' if not rows else ''),buttons+nav(),photo='booking')
+        buttons += [[('📋 Действующие','list:0:0'),('🗂 История','list:1:0')],[('👤 Мои данные','profile')],[('📅 Забронировать','begin')]]
+        await self.say(m,('🗂 История бронирований' if history else '📋 Мои бронирования')+('\n\nЗдесь пока пусто.' if not rows else '\n\nВыберите бронирование.'),buttons+nav(),photo='booking',edit=edit)
 
-    async def show(self,m,actor,ident):
+    async def show(self,m,actor,ident,edit=False):
         r=await self.store.get(actor,ident);rows=[]
-        if can_cancel(r['status'],r['starts_at'],datetime.now(TZ)):rows.append([('Отменить бронь','cancelask:'+ident)])
-        rows += [[('Связаться с администратором','contact')],[('Мои бронирования','list:0:0')]]
-        await self.say(m,card(r),rows+nav(),photo='booking')
+        if can_cancel(r['status'],r['starts_at'],datetime.now(TZ)):rows.append([('Отменить бронирование','cancelask:'+ident)])
+        rows += [[('☎️ Администратор','contact')],[('← Мои бронирования','list:0:0' if r['status'] in ('pending','confirmed') else 'list:1:0')]]
+        await self.say(m,card(r),rows+nav(),photo='booking',edit=edit)
 
     async def admin_link(self,m,actor):
         self.store.admin(actor)
-        if not self.settings.web_url:await self.say(m,'Веб-панель ещё настраивается.');return
+        if not self.settings.web_url:await self.say(m,'Панель пока недоступна.');return
         token=await self.store.login_token(actor)
-        await self.say(m,'Личная ссылка действует 5 минут и используется один раз. Не пересылайте её.',[[('Открыть веб-панель',self.settings.web_url+'/login#'+token)]])
+        await self.say(m,'🔐 Панель администратора\n\nЛичная ссылка действует 5 минут.\nНе пересылайте её.',[[('Открыть панель',self.settings.web_url+'/login#'+token)]]+nav())
+
+    async def cancel_profile(self,actor):
+        d=await self.unfinished(actor)
+        if d and d['state'].startswith('profile_'):
+            data=dict(d['data']);previous=data.pop('profile_return','name');data.pop('profile_name',None)
+            await self.store.save(actor,d,previous,data)
+
+    async def profile(self,m,actor,edit=False):
+        p=await self.store.profile(actor)
+        await self.say(m,('👤 Мои данные\n\n'+p['name']+'\n'+p['phone'] if p else '👤 Мои данные\n\nПока не сохранены.')+'\n\nТолько для будущих бронирований.',[[('✏️ Изменить данные','profileedit')],[('← Мои бронирования','list:0:0')]]+nav(),edit=edit)
 
     async def message(self,m):
         if m.chat.type!='private':return
-        actor=m.from_user.id;text=(m.text or '').strip()
+        actor=m.from_user.id
+        async with self.locks[actor]:
+            await self._message(m,actor)
+
+    async def _message(self,m,actor):
+        text=(m.text or '').strip()
         try:
-            if text in ('/start','Главное меню'):await self.home(m);return
+            if text in ('/start','/menu','Главное меню'):
+                await m.answer('Главное меню',reply_markup=ReplyKeyboardRemove())
+                await self.home(m,actor);return
             if text=='/id':await m.answer(str(actor));return
             if text=='/admin':await self.admin_link(m,actor);return
-            if text=='Забронировать':await self.start(m,actor);return
-            if text=='Мои бронирования':await self.listing(m,actor);return
-            if text in ('Правила','Контакты','Цены','Цены и услуги','Помощь'):await self.info(m,text);return
-            d=await self.store.draft(actor);data=d['data']
-            if d['state']=='name':data['name']=clean_name(text);state='phone'
-            elif d['state']=='phone':data['phone']=normalize_phone(text);state='services' if EXTRAS_ENABLED else 'review'
-            elif d['state']=='profile_name':
-                data['profile_name']=clean_name(text);await self.store.save(actor,d,'profile_phone',data);await self.say(m,'Теперь отправьте телефон для будущих заказов.');return
-            elif d['state']=='profile_phone':
-                await self.store.profile(actor,data['profile_name'],normalize_phone(text));await self.store.save(actor,d,'date',data);await self.say(m,'Данные обновлены. Уже отправленные брони не изменены.');return
-            else:await self.render(m,actor,d);return
-            data['consent']=False;await self.store.save(actor,d,state,data);await self.render(m,actor,await self.store.draft(actor))
-        except RuleError as e:await self.say(m,str(e))
+            if text in ('/book','Забронировать'):await self.start(m,actor);return
+            if text in ('/bookings','Мои бронирования'):await self.listing(m,actor);return
+            if text in ('/help','Правила','Контакты','Цены','Цены и услуги','Помощь'):
+                await self.leave_contact(m,actor);await self.info(m,actor,'Помощь' if text=='/help' else text);return
+            d=await self.unfinished(actor)
+            if not d:
+                await self.home(m,actor);return
+            state,data=d['state'],dict(d['data'])
+            if data.get('flow_version')!=VERSION:
+                await self.render(m,actor,d);return
+            profile=state.startswith('profile_')
+            if state in ('phone','phone_contact','profile_phone','profile_contact'):
+                contact=getattr(m,'contact',None)
+                if contact:
+                    if contact.user_id!=actor:raise RuleError('Поделитесь своим номером или введите телефон вручную.')
+                    phone=normalize_phone(contact.phone_number)
+                else:phone=normalize_phone(text)
+                if state.endswith('contact'):await m.answer('Номер получен.',reply_markup=ReplyKeyboardRemove())
+                if profile:
+                    await self.store.profile(actor,data['profile_name'],phone)
+                    previous=data.pop('profile_return','name');data.pop('profile_name',None)
+                    await self.store.save(actor,d,previous,data)
+                    await self.profile(m,actor);return
+                data['phone']=phone
+                state='review' if data.pop('editing',False) and data.get('start') else 'guests'
+            elif state in ('name','profile_name'):
+                name=clean_name(text)
+                if profile:data['profile_name']=name;state='profile_phone'
+                else:
+                    data['name']=name
+                    state='review' if data.pop('editing',False) and data.get('start') else 'phone'
+            else:
+                await self.say(m,'На этом шаге выберите действие кнопкой.',[[('Продолжить','resume')]]+nav());return
+            data['consent']=False
+            await self.store.save(actor,d,state,data)
+            await self.render(m,actor,await self.store.draft(actor,d['token']))
+        except RuleError as error:
+            await self.say(m,str(error),[[('Продолжить','resume')]]+nav())
 
     async def callback(self,c):
         if not c.message or c.message.chat.type!='private':return
-        await c.answer();actor=c.from_user.id;m=c.message;raw=c.data or '';parts=raw.split(':');a=parts[0]
+        await c.answer()
+        async with self.locks[c.from_user.id]:
+            await self._callback(c)
+
+    async def _callback(self,c):
+        actor,m=c.from_user.id,c.message
+        parts=(c.data or '').split(':');action=parts[0]
         try:
-            if a=='home':await self.home(m);return
-            if a=='begin':await self.start(m,actor);return
-            if a=='staffweb':await self.admin_link(m,actor);return
-            if a=='contact':await self.say(m,'Администратор: '+self.settings.content['phone'],[[('Маршрут',self.settings.content['map_url'])]]+nav());return
-            if a=='info':await self.info(m,parts[1]);return
-            if a=='list':await self.listing(m,actor,bool(int(parts[1])),int(parts[2]));return
-            if a=='open':await self.show(m,actor,parts[1]);return
-            if a=='legacy':
+            if action=='home':await self.home(m,actor,edit=True);return
+            if action=='begin':await self.start(m,actor,edit=True);return
+            if action=='staffweb':await self.admin_link(m,actor);return
+            if action=='contact':
+                await self.leave_contact(m,actor)
+                await self.say(m,'☎️ Администратор\n\n'+self.settings.content['phone']+'\n\nПозвоните по этому номеру.\nДля нестандартного времени согласуйте длительность заранее.',[[('📍 Маршрут',self.settings.content['map_url'])],[('← Назад','resume' if await self.unfinished(actor) else 'home')]]+nav(),edit=True);return
+            if action=='rulesfull':
+                await self.say(m,self.settings.rules,[[('← К бронированию','resume')] if await self.unfinished(actor) else [('← Главное меню','home')]]+nav());return
+            if action=='info':
+                await self.leave_contact(m,actor);await self.info(m,actor,parts[1],edit=True);return
+            if action=='list':await self.listing(m,actor,bool(int(parts[1])),int(parts[2]),edit=True);return
+            if action=='open':await self.leave_contact(m,actor);await self.show(m,actor,parts[1],edit=True);return
+            if action=='legacy':
                 r=await self.store.legacy(actor,parts[1])
-                if not r:raise RuleError('Прежняя заявка недоступна.')
-                d=r['data'];text='Прежняя заявка № '+r['id']+'\n'+str(d.get('start',''))+'\nГостей: '+str(d.get('guests',''))+'\nИмя: '+str(d.get('name',''))+'\nТелефон: '+str(d.get('phone',''))+'\nИтог: '+rub(r['estimate']['total'])+'\nСохранена из прежней версии. Эта заявка сама по себе не закрепляла время.'
-                await self.say(m,text,[[('История','list:1:0')]]+nav());return
-            if a=='cancelask':
-                r=await self.store.get(actor,parts[1]);await self.say(m,'Отменить эту бронь?\n'+card(r)+'\nВосстановление не гарантируется.',[[('Да, отменить','cancel:'+parts[1])],[('Нет, оставить','open:'+parts[1])]]);return
-            if a=='cancel':await self.store.transition(actor,parts[1],'cancel');await self.show(m,actor,parts[1]);return
-            if a=='profile':
-                p=await self.store.profile(actor);await self.say(m,('Мои данные\n'+p['name']+'\n'+p['phone'] if p else 'Контактные данные пока не сохранены.')+'\nИзменения только для будущих заказов.',[[('Изменить данные','profileedit')]]+nav());return
-            if a=='profileedit':
+                if not r:raise RuleError('Запись недоступна.')
+                data=r['data'];text=f'Прежняя заявка № {r["id"]}\n{data.get("start", "")}\nГостей: {data.get("guests", "")}\n{data.get("name", "")}\n{data.get("phone", "")}\n\nАрхив прежней версии. Статус уточните у администратора.'
+                await self.say(m,text,[[('← История','list:1:0')]]+nav(),edit=True);return
+            if action=='cancelask':
+                r=await self.store.get(actor,parts[1])
+                if not can_cancel(r['status'],r['starts_at'],datetime.now(TZ)):raise RuleError('Самостоятельная отмена недоступна. Свяжитесь с администратором.')
+                await self.say(m,'Отменить бронирование?\n\n'+card(r)+'\n\nОсвободившееся время могут занять другие гости.',[[('Да, отменить','cancel:'+parts[1])],[('← Сохранить бронь','open:'+parts[1])]]+nav(),edit=True);return
+            if action=='cancel':await self.store.transition(actor,parts[1],'cancel');await self.show(m,actor,parts[1],edit=True);return
+            if action=='profile':await self.leave_contact(m,actor);await self.profile(m,actor,edit=True);return
+            if action=='profileedit':
                 token=await self.store.begin(actor);d=await self.store.draft(actor,token)
-                await self.store.save(actor,d,'profile_name',d['data']);await self.say(m,'Введите имя для будущих заказов. Текущий черновик сохранён.');return
-            if a=='submit':
-                ident,created=await self.store.submit(actor,parts[1]);await self.say(m,'Заявка принята. Время занято за вами.' if created else 'Эта заявка уже сохранена.');await self.show(m,actor,ident);return
-            if len(parts)!=3:raise RuleError('Кнопка устарела. Откройте главное меню.')
-            _,token,v=parts;d=await self.store.draft(actor,token);data=d['data'];state=d['state'];new=state
-            if not EXTRAS_ENABLED and (a in ('product','qty','add','review') or (a=='back' and v=='services')):
-                await self.say(m,'Заказ дополнительных услуг временно недоступен. Продолжите бронирование.',[[('Продолжить бронирование','begin')]]+nav());return
-            if a=='noop':return
-            if a=='page' and state=='date':data['offset']=max(0,min(63,int(v)))
-            elif a=='day' and state=='date':
-                day=date.fromisoformat(v)
-                if not datetime.now(TZ).date()<=day<=horizon(datetime.now(TZ).date()):raise RuleError('Выберите доступную дату.')
-                data['day']=v;new='slot'
-            elif a=='slot' and state=='slot':
-                if int(v) not in SLOTS:raise RuleError('Выберите предложенный сеанс.')
-                start=datetime.combine(date.fromisoformat(data['day']),datetime.min.time(),TZ)+timedelta(hours=int(v));validate_start(start,datetime.now(TZ))
-                if not await self.store.free(start):raise RuleError('Время уже занято. Обновите список сеансов.')
-                data['start']=start.isoformat();new='guests'
-            elif a=='guest' and state=='guests':
-                paid=data['guests']-data['children'];kids=data['children'];delta=1 if v.endswith('+') else -1
-                if v.startswith('paid'):paid+=delta
-                elif v.startswith('kid'):kids+=delta
-                else:raise RuleError('Откройте количество гостей.')
-                if paid<0 or kids<0 or not 1<=paid+kids<=8:raise RuleError('Всего от 1 до 8 гостей, включая детей.')
-                data.update(guests=paid+kids,children=kids)
-            elif a=='next' and state=='guests' and v=='name':new='name'
-            elif a=='keep' and ((v=='name' and state=='name') or (v=='phone' and state=='phone')):
-                if not data.get(v):raise RuleError('Сначала укажите данные.')
-                new='phone' if v=='name' else ('services' if EXTRAS_ENABLED else 'review')
-            elif a=='product' and state=='services':
-                if v not in self.catalog:raise RuleError('Услуга недоступна.')
-                data.update(product=v,quantity=data.get('cart',{}).get(v,0),item_nonce=secrets.token_hex(4));new='product'
-            elif a=='qty' and state=='product':data['quantity']=max(0,min(1 if data['product'] in ('eucalyptus','lavender') else 100,data['quantity']+int(v)))
-            elif a=='add' and state=='product' and v==data['item_nonce']:
-                code=data['product'];cart=data.setdefault('cart',{});qty=data['quantity']
-                if code in ('eucalyptus','lavender') and qty:
-                    cart.pop('eucalyptus',None);cart.pop('lavender',None)
-                if qty:cart[code]=qty
-                else:cart.pop(code,None)
-                new='services'
-            elif a=='review' and state=='services':new='review'
-            elif a=='consent' and state=='review':data['consent']=not data.get('consent',False)
-            elif a=='back':
-                required={'date':(),'slot':('day',),'guests':('start',),'name':('start','guests'),'services':('name','phone','start')}
-                if v not in required or any(k not in data for k in required[v]):raise RuleError('Сначала заполните предыдущие шаги.')
-                new=v
-            else:raise RuleError('Эта кнопка уже обработана. Продолжите текущий черновик.')
-            if a!='consent':data['consent']=False
-            await self.store.save(actor,d,new,data);await self.render(m,actor,await self.store.draft(actor),edit=a in ('qty','guest','page','consent'))
-        except (RuleError,ValueError,IndexError,KeyError) as e:await self.say(m,str(e) if isinstance(e,RuleError) else 'Кнопка устарела. Откройте главное меню.')
+                if not d['state'].startswith('profile_'):
+                    data=dict(d['data'],profile_return=d['state'])
+                    await self.store.save(actor,d,'profile_name',data)
+                await self.render(m,actor,await self.store.draft(actor,token),edit=True);return
+            if action=='profilecancel':
+                d=await self.store.draft(actor)
+                if d['state'].startswith('profile_'):
+                    data=dict(d['data']);previous=data.pop('profile_return','name');data.pop('profile_name',None)
+                    await self.store.save(actor,d,previous,data)
+                    await m.answer('Изменение отменено.',reply_markup=ReplyKeyboardRemove())
+                await self.profile(m,actor,edit=True);return
+            if action=='resume':
+                await self.leave_contact(m,actor)
+                d=await self.unfinished(actor)
+                if d:await self.render(m,actor,d,edit=True)
+                else:await self.start(m,actor,edit=True)
+                return
+            if len(parts)!=4:raise RuleError('Это кнопка прежнего экрана. Откройте текущее бронирование.')
+            action,token,revision,value=parts
+            if action=='submit':
+                ident,created=await self.store.submit(actor,token,expected_revision=int(revision))
+                await self.say(m,'✅ Заявка отправлена\n\nВремя занято за вами.\nАдминистратор подтвердит или отклонит заявку.\nМы сообщим о решении здесь.' if created else 'Эта заявка уже отправлена.',[[('📋 Открыть бронирование','open:'+ident)]]+nav(),photo='booking',edit=True);return
+            d=await self.store.draft(actor,token)
+            if d['revision']!=int(revision):
+                await self.say(m,'Экран уже изменился.\nПродолжите с актуального шага.',[[('Продолжить','resume')]]+nav());return
+            state,data=d['state'],dict(d['data']);new=state
+            if action in ('noop','limit'):
+                if action=='limit':await self.say(m,'Вместимость — до 8 гостей вместе с детьми.' if value=='max' else 'Укажите хотя бы одного гостя.',[[('← К гостям','resume')]]+nav())
+                return
+            if action=='discardask':
+                await self.say(m,'Отменить оформление?\n\nОтправленные бронирования сохранятся.',[[('Да, отменить оформление',callback('discard',d))],[('← Продолжить','resume')]]+nav(),edit=True);return
+            if action=='discard':
+                await self.store.abandon_draft(actor,d)
+                await self.home(m,actor,edit=True);return
+            if action=='resetask':
+                await self.say(m,'Начать заново?\n\nТолько незавершённый черновик будет сброшен. Отправленные брони сохранятся.',[[('Начать заново',callback('reset',d))],[('← Продолжить', 'resume')]]+nav(),edit=True);return
+            if action=='reset':
+                await self.store.reset_draft(actor,d)
+                await self.render(m,actor,await self.store.draft(actor),edit=True);return
+            if action=='resume_step':await self.render(m,actor,d,edit=True);return
+            if action=='editmenu' and state=='review':
+                rows=[[('👤 Имя',callback('edit',d,'name')),('📱 Телефон',callback('edit',d,'phone'))],[('👥 Гости',callback('edit',d,'guests'))],[('📅 Дата',callback('edit',d,'date')),('🕒 Время',callback('edit',d,'slot'))],[('← К проверке','resume')]]
+                await self.say(m,'✏️ Что изменить?\n\nОстальные данные сохранятся.',rows+nav(),edit=True);return
+            if action=='rules' and state=='review':
+                await self.info(m,actor,'Правила',back='resume',edit=True);return
+            if action=='share' and state in ('phone','profile_phone'):
+                await self.store.save(actor,d,'profile_contact' if state=='profile_phone' else 'phone_contact',data)
+                keyboard=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='📱 Поделиться моим номером',request_contact=True)],[KeyboardButton(text='Главное меню')]],resize_keyboard=True,one_time_keyboard=True)
+                await m.answer('Разрешаете использовать ваш номер Telegram для связи по бронированию?\n\nНажмите кнопку ниже или напишите другой номер.',reply_markup=keyboard)
+                return
+            if action in ('back','edit'):
+                require(data,value)
+                new=value
+                if action=='edit':data['editing']=True
+                else:data.pop('editing',None)
+            elif action=='keep' and ((value=='name' and state=='name') or (value=='phone' and state=='phone')):
+                if value=='name':data['name']=clean_name(data.get('name',''));new='phone'
+                else:data['phone']=normalize_phone(data.get('phone',''));new='guests'
+                if data.pop('editing',False) and data.get('start'):new='review'
+            elif action=='guest' and state=='guests':data=change_guests(data,value[:-1],1 if value.endswith('+') else -1)
+            elif action=='next' and state=='guests' and value=='date':
+                require(data,'date');new='review' if data.pop('editing',False) and data.get('start') else 'date'
+            elif action=='month' and state=='date':
+                month=date.fromisoformat(value)
+                today=datetime.now(TZ).date()
+                if not today.replace(day=1)<=month<=horizon(today).replace(day=1) or month.day!=1:raise RuleError('Выберите доступный месяц.')
+                data['month']=value
+            elif action=='day' and state=='date':
+                day=date.fromisoformat(value);today=datetime.now(TZ).date()
+                if not today<=day<=horizon(today):raise RuleError('Выберите доступную дату.')
+                if any(r['starts_at'].astimezone(TZ).date()==day for r in await self.store.listing(actor)):raise RuleError('На эту дату у вас уже есть бронь.')
+                if data.get('day')!=value:data.pop('start',None)
+                data['day']=value;new='slot'
+            elif action=='refresh' and state=='slot':pass
+            elif action=='slot' and state=='slot':
+                hour=int(value)
+                if hour not in SLOTS:raise RuleError('Выберите время кнопкой.')
+                start=datetime.combine(date.fromisoformat(data['day']),datetime.min.time(),TZ)+timedelta(hours=hour)
+                validate_start(start,datetime.now(TZ))
+                if not await self.store.free(start):raise RuleError('Это время уже занято. Обновите список сеансов.')
+                data['start']=start.isoformat();data.pop('editing',None);new='review'
+            elif action=='consent' and state=='review':data['consent']=not data.get('consent',False)
+            else:raise RuleError('Кнопка недоступна на этом шаге. Продолжите бронирование.')
+            if action!='consent':data['consent']=False
+            await self.store.save(actor,d,new,data)
+            await self.render(m,actor,await self.store.draft(actor,token),edit='caption' if action in ('guest','month','consent') else True)
+        except (RuleError,ValueError,IndexError,KeyError) as error:
+            await self.say(m,str(error) if isinstance(error,RuleError) else 'Откройте актуальный экран.',[[('Продолжить бронирование','resume')],[('📋 Мои бронирования','list:0:0')],[('☎️ Администратор','contact')]]+nav())
