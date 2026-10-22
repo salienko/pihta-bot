@@ -143,6 +143,32 @@ class Database(unittest.IsolatedAsyncioTestCase):
             r=await client.get('/');self.assertEqual(r.status,200);self.assertIn('no-store',r.headers['Cache-Control']);self.assertIn('frame-ancestors',r.headers['Content-Security-Policy'])
             ident=await self.book();r=await client.post('/booking/'+ident+'/confirm',data={'csrf':'wrong'},headers={'Origin':self.settings.web_url});self.assertEqual(r.status,403)
         finally:await client.close()
+    async def test_login_form_policy_and_strict_origin(self):
+        client=TestClient(TestServer(make_app(self.store,self.settings,secure=True)));await client.start_server()
+        try:
+            response=await client.get('/login')
+            self.assertEqual(response.headers['Referrer-Policy'],'same-origin')
+            for origin in (None,'null','https://evil.test'):
+                token=await self.store.login_token(1)
+                headers={'Origin':origin} if origin else {}
+                response=await client.post('/login',data={'token':token},headers=headers,allow_redirects=False)
+                self.assertEqual(response.status,403)
+                # Rejection did not consume the token. A valid same-origin POST can use it.
+                response=await client.post('/login',data={'token':token},headers={'Origin':self.settings.web_url},allow_redirects=False)
+                self.assertEqual(response.status,302)
+                cookie=response.cookies['pihta_session']
+                self.assertTrue(cookie['secure']);self.assertTrue(cookie['httponly']);self.assertEqual(cookie['samesite'],'Strict')
+                response=await client.post('/login',data={'token':token},headers={'Origin':self.settings.web_url},allow_redirects=False)
+                self.assertEqual(response.status,400)
+            session=await self.store.login(await self.store.login_token(1))
+            client.session.cookie_jar.update_cookies({'pihta_session':session})
+            csrf=(await self.store.session(session))['csrf']
+            for origin in (None,'null','https://evil.test'):
+                response=await client.post('/logout',data={'csrf':csrf},headers={'Origin':origin} if origin else {},allow_redirects=False)
+                self.assertEqual(response.status,403)
+            self.assertIsNotNone(await self.store.session(session))
+        finally:await client.close()
+
     async def test_old_inventory_does_not_affect_rental(self):
         t=await self.ready();await self.store.pool.execute("INSERT INTO service_settings VALUES('oak',false)")
         ident,_=await self.store.submit(2,t)

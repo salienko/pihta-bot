@@ -24,7 +24,7 @@ def make_app(store,settings,secure=True):
         try:response=await handler(request)
         except RuleError as error:response=web.Response(status=400,text=page('Не выполнено','<div class="card"><h1>Действие не выполнено</h1><p>'+e(error)+'</p><a href="/">Вернуться</a></div>'),content_type='text/html')
         except web.HTTPException as error:response=error
-        response.headers.update({'Cache-Control':'no-store','Referrer-Policy':'no-referrer','X-Content-Type-Options':'nosniff','X-Frame-Options':'DENY','Content-Security-Policy':"default-src 'none'; style-src 'self'; script-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'; connect-src 'self'; img-src 'self'"})
+        response.headers.update({'Cache-Control':'no-store','Referrer-Policy':'same-origin','X-Content-Type-Options':'nosniff','X-Frame-Options':'DENY','Content-Security-Policy':"default-src 'none'; style-src 'self'; script-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'; connect-src 'self'; img-src 'self'"})
         if secure:response.headers['Strict-Transport-Security']='max-age=31536000'
         return response
     app=web.Application(middlewares=[security],client_max_size=16384)
@@ -33,7 +33,7 @@ def make_app(store,settings,secure=True):
         s=await store.session(request.cookies.get('pihta_session'))
         if not s:raise web.HTTPFound('/login')
         if post:
-            if request.headers.get('Origin')!=settings.web_url and not (not secure and request.headers.get('Origin')=='null'):raise web.HTTPForbidden(text='Неверный источник запроса.')
+            if request.headers.get('Origin')!=settings.web_url:raise web.HTTPForbidden(text='Неверный источник запроса.')
             data=await request.post()
             if not hmac.compare_digest(str(data.get('csrf','')),s['csrf']):raise web.HTTPForbidden(text='Обновите страницу и повторите действие.')
         return s
@@ -46,7 +46,7 @@ def make_app(store,settings,secure=True):
         return web.Response(text=page('Вход',body),content_type='text/html')
     async def login_js(request):return web.Response(text="function takeToken(){const token=location.hash.slice(1);history.replaceState(null,'','/login');if(token){document.getElementById('token').value=token;document.getElementById('enter').hidden=false;}}takeToken();addEventListener('hashchange',takeToken);",content_type='text/javascript')
     async def login(request):
-        if request.headers.get('Origin')!=settings.web_url and not (not secure and request.headers.get('Origin')=='null'):raise web.HTTPForbidden()
+        if request.headers.get('Origin')!=settings.web_url:raise web.HTTPForbidden()
         data=await request.post();token=await store.login(str(data.get('token','')))
         response=web.HTTPFound('/');response.set_cookie('pihta_session',token,secure=secure,httponly=True,samesite='Strict',max_age=8*3600,path='/');return response
     async def logout(request):
