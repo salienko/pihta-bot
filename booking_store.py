@@ -1,4 +1,5 @@
 """Single-resource booking service. Every calendar/status mutation takes one DB lock."""
+from settings import EXTRAS_ENABLED
 import hashlib
 import json
 import re
@@ -112,7 +113,10 @@ class BookingStore:
             if old:return old,False
             d=unpack(await db.fetchrow('SELECT * FROM drafts WHERE telegram_id=$1 FOR UPDATE',actor))
             if not d or d['token']!=token or d['state']!='review':raise RuleError('Откройте итог текущего черновика.')
-            data=d['data'];start=datetime.fromisoformat(data['start']);end=validate_start(start,clock)
+            data=d['data']
+            if not EXTRAS_ENABLED and data.get('cart'):
+                raise RuleError('Заказ дополнительных услуг временно недоступен. Откройте итог бронирования заново.')
+            start=datetime.fromisoformat(data['start']);end=validate_start(start,clock)
             if not data.get('consent') or data.get('rules_hash')!=self.settings.rules_hash:raise RuleError('Примите актуальные правила.')
             data['name']=clean_name(data['name']);data['phone']=normalize_phone(data['phone'])
             catalog,holidays=await self.pricing(db)

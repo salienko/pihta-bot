@@ -5,7 +5,7 @@ import os
 import json
 import secrets
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock,patch
 from aiohttp.test_utils import TestClient,TestServer
 from settings import load
 from booking_domain import TZ,RuleError,estimate,validate_start,can_cancel
@@ -46,6 +46,8 @@ URL=os.getenv('TEST_DATABASE_URL','')
 @unittest.skipUnless(URL,'TEST_DATABASE_URL is required for PostgreSQL tests')
 class Database(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        self.extras_patches=[patch('booking_ui.EXTRAS_ENABLED',True),patch('booking_store.EXTRAS_ENABLED',True)]
+        for feature_patch in self.extras_patches:feature_patch.start();self.addCleanup(feature_patch.stop)
         self.schema='test_booking_'+secrets.token_hex(8);self.settings=replace(load(),database_url=URL,admin_ids=(1,),web_url='https://pihta.test')
         self.store=await BookingStore.connect(self.settings,self.schema)
         self.start=(datetime.now(TZ)+timedelta(days=4)).replace(hour=13,minute=0,second=0,microsecond=0)
@@ -58,6 +60,13 @@ class Database(unittest.IsolatedAsyncioTestCase):
         data['quote']=estimate(data,self.catalog,{})
         await self.store.save(actor,d,'review',data);return t
     async def book(self,actor=2,delta=0):return (await self.store.submit(actor,await self.ready(actor,delta)))[0]
+    async def test_booking_only_rejects_stale_cart_on_submit(self):
+        token=await self.ready()
+        with patch('booking_store.EXTRAS_ENABLED',False):
+            with self.assertRaisesRegex(RuleError,'временно недоступен'):
+                await self.store.submit(2,token)
+        self.assertEqual(await self.store.pool.fetchval('SELECT count(*) FROM bookings'),0)
+
     async def test_concurrent_slot_only_one_winner(self):
         a,b=await self.ready(2),await self.ready(3)
         results=await asyncio.gather(self.store.submit(2,a),self.store.submit(3,b),return_exceptions=True)
@@ -175,3 +184,45 @@ class Database(unittest.IsolatedAsyncioTestCase):
         def call(data):return SimpleNamespace(message=message,from_user=SimpleNamespace(id=2),data=data,answer=AsyncMock())
         await ui.callback(call(f'product:{t}:birch'));await ui.callback(call(f'qty:{t}:1'));d=await self.store.draft(2,t);self.assertNotIn('birch',d['data']['cart'])
         await ui.callback(call(f'add:{t}:'+d['data']['item_nonce']));self.assertEqual((await self.store.draft(2,t))['data']['cart']['birch'],1)
+
+
+class BookingOnlyUI(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        from types import SimpleNamespace
+        self.settings=load()
+        self.store=SimpleNamespace(pricing=AsyncMock(return_value=({},{})),save=AsyncMock())
+        self.ui=BookingUI(self.settings,self.store)
+        self.ui.say=AsyncMock()
+        self.message=SimpleNamespace(chat=SimpleNamespace(type='private'),from_user=SimpleNamespace(id=2),text='+79812440050')
+
+    async def test_phone_goes_directly_to_review(self):
+        d={'state':'phone','token':'abc','data':{}}
+        self.store.draft=AsyncMock(return_value=d)
+        self.ui.render=AsyncMock()
+        await self.ui.message(self.message)
+        self.assertEqual(self.store.save.call_args.args[2],'review')
+
+    async def test_old_product_buttons_are_blocked(self):
+        from types import SimpleNamespace
+        self.store.draft=AsyncMock(return_value={'state':'services','data':{},'token':'abc'})
+        for action in ('product:abc:oak','qty:abc:1','add:abc:nonce','back:abc:services'):
+            await self.ui.callback(SimpleNamespace(message=self.message,from_user=SimpleNamespace(id=2),data=action,answer=AsyncMock()))
+        self.store.save.assert_not_awaited()
+        self.assertEqual(self.ui.say.await_count,4)
+
+    async def test_old_cart_is_removed_and_requires_consent(self):
+        from booking_ui import EXTRAS_ENABLED
+        self.assertFalse(EXTRAS_ENABLED)
+        d={'state':'product','token':'abc','data':dict(start='2026-11-01T13:00:00+03:00',guests=2,children=0,hours=2,name='Иван',phone='+79812440050',cart={'oak':2},consent=True)}
+        await self.ui.render(self.message,2,d)
+        self.assertEqual(d['data']['cart'],{})
+        self.assertFalse(d['data']['consent'])
+        self.assertEqual(self.store.save.call_args.args[2],'review')
+        labels=str(self.ui.say.call_args.args[2])
+        self.assertNotIn('Изменить услуги',labels)
+
+    async def test_prices_hide_product_catalog(self):
+        await self.ui.info(self.message,'Цены и услуги')
+        text=self.ui.say.call_args.args[1]
+        self.assertNotIn('Дубовый',text)
+        self.assertIn('временно недоступен',text)

@@ -1,4 +1,5 @@
 """Native Telegram conversation. Persistent drafts; no Mini App."""
+from settings import EXTRAS_ENABLED
 from datetime import datetime,date,timedelta
 from pathlib import Path
 import secrets
@@ -7,7 +8,7 @@ from aiogram.types import ReplyKeyboardMarkup,KeyboardButton,InlineKeyboardMarku
 from aiogram.exceptions import TelegramBadRequest
 from booking_domain import TZ,SLOTS,LABELS,RuleError,estimate,card,can_cancel,validate_start,clean_name,normalize_phone,horizon,rub
 
-MENU=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=a),KeyboardButton(text=b)] for a,b in [('Забронировать','Цены и услуги'),('Мои бронирования','Правила'),('Контакты','Помощь')]],resize_keyboard=True,is_persistent=True)
+MENU=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=a),KeyboardButton(text=b)] for a,b in [('Забронировать','Цены'),('Мои бронирования','Правила'),('Контакты','Помощь')]],resize_keyboard=True,is_persistent=True)
 def kb(rows):return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t,**({'url':v} if v.startswith('https://') else {'callback_data':v})) for t,v in row] for row in rows])
 def nav():return [[('Главное меню','home')]]
 
@@ -37,9 +38,9 @@ class BookingUI:
         c=self.settings.content
         if section=='Контакты':await self.say(m,c['name']+'\n'+c['phone']+'\nПосёлок Приладожское',[[('Маршрут · Яндекс Карты',c['map_url'])],[('Позвонить / связаться','contact')]]+nav(),photo='home');return
         if section=='Правила':await self.say(m,self.settings.rules);return
-        if section=='Цены и услуги':
-            text='Аренда на 2 часа:\nПН–ПТ до 19:00 — 5000 ₽\nПН–ПТ с 19:00 и выходные — 6000 ₽\nПраздники, кроме Нового года — 6500 ₽\nСледующий час по согласованию: 2300 / 2800 / 3000 ₽.\nСвыше 4 гостей с 7 лет: 250 ₽/час за гостя. Максимум 8 вместе с детьми.\nПростыня на каждого гостя включена; полотенца платные.\n\n'+'\n'.join(f"{i['name']} — {rub(i['price'])}/{i.get('unit','шт.')}" for i in self.catalog.values())
-            await self.say(m,text,[[('Забронировать','begin')],[('Связаться с администратором','contact')]]+nav(),photo='extras');return
+        if section in ('Цены','Цены и услуги'):
+            text='Аренда на 2 часа:\nПН–ПТ до 19:00 — 5000 ₽\nПН–ПТ с 19:00 и выходные — 6000 ₽\nПраздники, кроме Нового года — 6500 ₽\nСледующий час по согласованию: 2300 / 2800 / 3000 ₽.\nСвыше 4 гостей с 7 лет: 250 ₽/час за гостя. Максимум 8 вместе с детьми.\nПростыня на каждого гостя включена; полотенца платные.\n\n'+('\n'.join(f"{i['name']} — {rub(i['price'])}/{i.get('unit','шт.')}" for i in self.catalog.values()) if EXTRAS_ENABLED else 'Заказ дополнительных услуг в боте временно недоступен.')
+            await self.say(m,text,[[('Забронировать','begin')],[('Связаться с администратором','contact')]]+nav(),photo='home');return
         await self.say(m,'Черновик можно менять. Отправленная заявка занимает время и ждёт подтверждения. После отправки изменения невозможны — только отмена и новая бронь.\nОплата полностью на месте до начала.\nКонтакт администратора: '+c['phone'],nav())
 
     async def start(self,m,actor):
@@ -50,7 +51,15 @@ class BookingUI:
 
     async def render(self,m,actor,d,edit=False):
         self.catalog,holidays=await self.store.pricing()
-        state=d['state'];data=d['data'];t=d['token'];b=lambda a,v='':f'{a}:{t}:{v}'
+        state=d['state'];data=d['data'];
+        if not EXTRAS_ENABLED:
+            changed=bool(data.get('cart')) or state in ('services','product')
+            data['cart']={}
+            if state in ('services','product'):state='review'
+            if changed:
+                data['consent']=False
+                await self.store.save(actor,d,state,data)
+        t=d['token'];b=lambda a,v='':f'{a}:{t}:{v}'
         if state=='date':
             today=datetime.now(TZ).date();offset=data.get('offset',0);days=(horizon(today)-today).days+1
             rows=[[((today+timedelta(days=i)).strftime('%d.%m.%Y'),b('day',(today+timedelta(days=i)).isoformat()))] for i in range(offset,min(days,offset+7))]
@@ -98,7 +107,8 @@ class BookingUI:
             if start-datetime.now(TZ)<timedelta(hours=24):text+='\nДо начала менее суток: после подтверждения отмена только через администратора.'
             rows=[[('Прочитать правила','info:Правила')],[(('☑' if data.get('consent') else '□')+' С правилами ознакомлен и согласен',b('consent'))]]
             if data.get('consent'):rows.append([('Отправить на подтверждение',b('submit'))])
-            rows += [[('Изменить услуги в черновике',b('back','services'))],[('Изменить дату и гостей',b('back','date'))]]
+            if EXTRAS_ENABLED:rows.append([('Изменить услуги в черновике',b('back','services'))])
+            rows += [[('Изменить контакты',b('back','name'))],[('Изменить дату и гостей',b('back','date'))]]
             await self.say(m,text,rows+nav(),photo='booking')
 
     async def listing(self,m,actor,history=False,offset=0):
@@ -132,10 +142,10 @@ class BookingUI:
             if text=='/admin':await self.admin_link(m,actor);return
             if text=='Забронировать':await self.start(m,actor);return
             if text=='Мои бронирования':await self.listing(m,actor);return
-            if text in ('Правила','Контакты','Цены и услуги','Помощь'):await self.info(m,text);return
+            if text in ('Правила','Контакты','Цены','Цены и услуги','Помощь'):await self.info(m,text);return
             d=await self.store.draft(actor);data=d['data']
             if d['state']=='name':data['name']=clean_name(text);state='phone'
-            elif d['state']=='phone':data['phone']=normalize_phone(text);state='services'
+            elif d['state']=='phone':data['phone']=normalize_phone(text);state='services' if EXTRAS_ENABLED else 'review'
             elif d['state']=='profile_name':
                 data['profile_name']=clean_name(text);await self.store.save(actor,d,'profile_phone',data);await self.say(m,'Теперь отправьте телефон для будущих заказов.');return
             elif d['state']=='profile_phone':
@@ -172,6 +182,8 @@ class BookingUI:
                 ident,created=await self.store.submit(actor,parts[1]);await self.say(m,'Заявка принята. Время занято за вами.' if created else 'Эта заявка уже сохранена.');await self.show(m,actor,ident);return
             if len(parts)!=3:raise RuleError('Кнопка устарела. Откройте главное меню.')
             _,token,v=parts;d=await self.store.draft(actor,token);data=d['data'];state=d['state'];new=state
+            if not EXTRAS_ENABLED and (a in ('product','qty','add','review') or (a=='back' and v=='services')):
+                await self.say(m,'Заказ дополнительных услуг временно недоступен. Продолжите бронирование.',[[('Продолжить бронирование','begin')]]+nav());return
             if a=='noop':return
             if a=='page' and state=='date':data['offset']=max(0,min(63,int(v)))
             elif a=='day' and state=='date':
@@ -193,7 +205,7 @@ class BookingUI:
             elif a=='next' and state=='guests' and v=='name':new='name'
             elif a=='keep' and ((v=='name' and state=='name') or (v=='phone' and state=='phone')):
                 if not data.get(v):raise RuleError('Сначала укажите данные.')
-                new='phone' if v=='name' else 'services'
+                new='phone' if v=='name' else ('services' if EXTRAS_ENABLED else 'review')
             elif a=='product' and state=='services':
                 if v not in self.catalog:raise RuleError('Услуга недоступна.')
                 data.update(product=v,quantity=data.get('cart',{}).get(v,0),item_nonce=secrets.token_hex(4));new='product'

@@ -6,6 +6,9 @@ import json
 import os
 import re
 
+# Temporary booking-only release. Re-enable only after linked extras are implemented.
+EXTRAS_ENABLED = False
+
 ROOT = Path(__file__).resolve().parent
 
 
