@@ -58,7 +58,9 @@ class BookingUI:
             if state in ('services','product'):state='review'
             if changed:
                 data['consent']=False
-                await self.store.save(actor,d,state,data)
+                if state!='review':
+                    await self.store.save(actor,d,state,data)
+                    d=await self.store.draft(actor,d['token'])
         t=d['token'];b=lambda a,v='':f'{a}:{t}:{v}'
         if state=='date':
             today=datetime.now(TZ).date();offset=data.get('offset',0);days=(horizon(today)-today).days+1

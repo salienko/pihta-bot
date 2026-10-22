@@ -1,3 +1,4 @@
+from settings import EXTRAS_ENABLED
 """Booking policies. Money is integer kopecks; all dates are Moscow-aware."""
 from datetime import datetime, timedelta
 from domain import TZ, RuleError, horizon, participants, clean_name, normalize_phone, rub
@@ -53,7 +54,7 @@ def card(row, personal=True):
            f"Дети до 6 лет включительно: {d['children']}",f"Простыни включены: {d['guests']} шт.",
            f"Аренда: {rub(q['rent'])}",f"Доплата за гостей: {rub(q['guest_extra'])}"]
     lines += [f"{i['name']} × {i['quantity']} — {rub(i['total'])}" for i in q['items']]
-    if not q['items']:lines.append('Дополнительные услуги не выбраны.')
+    if EXTRAS_ENABLED and not q['items']:lines.append('Дополнительные услуги не выбраны.')
     lines += [f"Итого по брони: {rub(q['total'])}",f"Оплачено: {rub(row.get('paid',0))}"]
     actual=row.get('actual_total');total=actual if actual is not None else q['total']
     if actual is not None:lines.append('Фактический расчёт отдельно: '+rub(actual))

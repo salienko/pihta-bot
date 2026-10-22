@@ -60,6 +60,17 @@ class Database(unittest.IsolatedAsyncioTestCase):
         data['quote']=estimate(data,self.catalog,{})
         await self.store.save(actor,d,'review',data);return t
     async def book(self,actor=2,delta=0):return (await self.store.submit(actor,await self.ready(actor,delta)))[0]
+    async def test_booking_only_resumes_old_cart_to_review(self):
+        token=await self.ready();d=await self.store.draft(2,token)
+        await self.store.save(2,d,'services',d['data'])
+        ui=BookingUI(self.settings,self.store);ui.say=AsyncMock()
+        with patch('booking_ui.EXTRAS_ENABLED',False):
+            await ui.render(None,2,await self.store.draft(2,token))
+        d=await self.store.draft(2,token)
+        self.assertEqual(d['state'],'review');self.assertEqual(d['data']['cart'],{})
+        self.assertFalse(d['data']['consent'])
+        self.assertEqual(d['data']['quote']['items'],[])
+
     async def test_booking_only_rejects_stale_cart_on_submit(self):
         token=await self.ready()
         with patch('booking_store.EXTRAS_ENABLED',False):
