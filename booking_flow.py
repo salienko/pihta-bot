@@ -66,3 +66,37 @@ def callback(action, draft, value=''):
     result = f'{action}:{draft["token"]}:{draft["revision"]}:{value}'
     if len(result.encode()) > 64: raise ValueError('Callback exceeds Telegram limit')
     return result
+
+
+FIELDS = ('name','phone','guests','day','start')
+
+
+def collected_fields(state, data):
+    """Only fields accepted in this journey; saved profile defaults are not answers."""
+    if '_filled' in data:return list(data['_filled'])
+    if state.endswith('contact'):state='profile_phone' if state.startswith('profile') else 'phone'
+    if state.startswith('profile_'):state=data.get('profile_return','name')
+    if data.get('editing') and data.get('start'):return [key for key in FIELDS if key in data]
+    count={'name':0,'phone':1,'guests':2,'date':3,'slot':4,'review':5}.get(state,0)
+    return [key for key in FIELDS[:count] if key in data]
+
+
+def accept_field(data, field):
+    fields=list(data.get('_filled',[]))
+    if field not in fields:fields.append(field)
+    data['_filled']=fields
+
+
+def booking_summary(data, exclude=()):
+    lines=['Ваше бронирование']
+    fields=data.get('_filled',[])
+    if 'name' in fields and 'name' not in exclude and data.get('name'):lines.append('👤 Имя: '+data['name'])
+    if 'phone' in fields and 'phone' not in exclude and data.get('phone'):lines.append('📱 Телефон: '+data['phone'])
+    if 'guests' in fields and 'guests' not in exclude:
+        lines += [f'👥 Кол-во гостей: {data["guests"]}',f'От 7 лет: {data["guests"]-data["children"]} · дети до 6 лет: {data["children"]}']
+    if 'day' in fields and 'day' not in exclude and data.get('day'):lines.append('📅 Дата: '+date.fromisoformat(data['day']).strftime('%d.%m.%Y'))
+    if 'start' in fields and 'start' not in exclude and data.get('start'):
+        from datetime import timedelta
+        start=datetime.fromisoformat(data['start']).astimezone(TZ)
+        lines.append(f'🕒 Время: {start:%H:%M}–{start+timedelta(hours=2):%H:%M} · Москва')
+    return '\n'.join(lines)+'\n\n'

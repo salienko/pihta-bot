@@ -221,7 +221,7 @@ class Database(unittest.IsolatedAsyncioTestCase):
     async def fill_journey(self):
         self.make_ui();await self.click('begin',raw=True)
         self.assertEqual((await self.store.draft(2))['state'],'name')
-        await self.enter('Иван');self.assertEqual((await self.store.draft(2))['state'],'phone')
+        await self.enter('Иван');self.assertEqual((await self.store.draft(2))['state'],'phone_contact')
         await self.enter('+79812440050');self.assertEqual((await self.store.draft(2))['state'],'guests')
         await self.click('guest','paid+');await self.click('next','date')
         self.assertEqual((await self.store.draft(2))['state'],'date')
@@ -259,7 +259,7 @@ class Database(unittest.IsolatedAsyncioTestCase):
 
     async def test_wrong_contact_rejected_own_contact_accepted(self):
         from types import SimpleNamespace
-        self.make_ui();await self.click('begin',raw=True);await self.enter('Иван');await self.click('share')
+        self.make_ui();await self.click('begin',raw=True);await self.enter('Иван')
         self.m.contact=SimpleNamespace(user_id=3,phone_number='79812440050');await self.ui.message(self.m)
         self.assertEqual((await self.store.draft(2))['state'],'phone_contact')
         self.m.contact.user_id=2;await self.ui.message(self.m)
@@ -306,6 +306,11 @@ class Database(unittest.IsolatedAsyncioTestCase):
         from booking_ui import kb
         for call in self.ui.say.call_args_list:
             text=call.args[1];rows=call.args[2]
+            reply=call.kwargs.get('reply_markup')
+            if reply is not None:
+                self.assertTrue(any(button.request_contact for row in reply.keyboard for button in row))
+                self.assertTrue(any(button.text=='🏠 Главное меню' for row in reply.keyboard for button in row))
+                continue
             markup=kb(rows)
             self.assertLessEqual(len(text),1000)
             self.assertTrue(any(button.callback_data=='home' for row in markup.inline_keyboard for button in row))
@@ -325,6 +330,53 @@ class Database(unittest.IsolatedAsyncioTestCase):
         await self.store.transition(1,first,'confirm',staff=True)
         rows=await self.store.listing(1,staff=True,status_filter='pending')
         self.assertEqual([r['id'] for r in rows],[second])
+
+    async def test_phone_sharing_is_available_on_first_card(self):
+        self.make_ui();await self.click('begin',raw=True);await self.enter('Иван')
+        call=self.ui.say.call_args
+        self.assertIn('Укажите телефон',call.args[1])
+        self.assertNotIn('Разрешаете',call.args[1])
+        keyboard=call.kwargs['reply_markup']
+        self.assertTrue(any(b.request_contact for row in keyboard.keyboard for b in row))
+        self.assertFalse(any('share:' in value for row in call.args[2] for _,value in row))
+        self.assertIn('Иван',call.args[1]);self.assertNotRegex(call.args[1],r'\d из 6')
+
+    async def test_phone_back_saved_number_and_keyboard_departure(self):
+        await self.store.profile(2,'Пётр','+79810000000')
+        self.make_ui();await self.click('begin',raw=True);await self.click('keep','name')
+        await self.enter('← Назад');d=await self.store.draft(2)
+        self.assertEqual(d['state'],'name')
+        self.assertTrue(self.m.answer.call_args.kwargs['reply_markup'].remove_keyboard)
+        await self.click('keep','name');await self.enter('✓ Использовать +79810000000')
+        d=await self.store.draft(2)
+        self.assertEqual(d['state'],'guests');self.assertEqual(d['data']['phone'],'+79810000000')
+        await self.click('back','phone');await self.click('home',raw=True)
+        self.assertTrue(self.m.answer.call_args.kwargs['reply_markup'].remove_keyboard)
+
+    async def test_accumulating_summary_hides_unaccepted_profile_defaults(self):
+        await self.store.profile(2,'Сохранённое имя','+79810000000')
+        self.make_ui();await self.click('begin',raw=True)
+        self.assertNotIn('👤 Имя:',self.ui.say.call_args.args[1])
+        self.assertNotIn('📱 Телефон:',self.ui.say.call_args.args[1])
+        await self.enter('Иван')
+        text=self.ui.say.call_args.args[1]
+        self.assertIn('👤 Имя: Иван',text);self.assertNotIn('📱 Телефон:',text)
+        await self.enter('+79812440050');await self.click('next','date')
+        text=self.ui.say.call_args.args[1]
+        for value in ('Иван','+79812440050','Кол-во гостей: 1'):self.assertIn(value,text)
+        await self.click('day',self.start.date().isoformat())
+        self.assertIn(self.start.strftime('%d.%m.%Y'),self.ui.say.call_args.args[1])
+        await self.click('slot','13');await self.click('edit','name');await self.enter('Пётр')
+        await self.click('back','slot')
+        self.assertIn('Пётр',self.ui.say.call_args.args[1]);self.assertNotIn('Иван',self.ui.say.call_args.args[1])
+
+    async def test_uniform_back_labels_and_no_step_numbers(self):
+        await self.fill_journey();await self.click('editmenu')
+        for call in self.ui.say.call_args_list:
+            self.assertNotRegex(call.args[1],r'\d из 6')
+            for row in call.args[2]:
+                for text,_ in row:
+                    if text.startswith('←'):self.assertEqual(text,'← Назад')
 
     async def test_no_extras_in_customer_or_admin_navigation(self):
         await self.fill_journey()

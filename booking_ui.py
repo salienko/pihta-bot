@@ -10,7 +10,7 @@ from aiogram.types import (ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardBut
 from aiogram.exceptions import TelegramBadRequest
 from booking_domain import (TZ, SLOTS, LABELS, RuleError, estimate, card, can_cancel,
                             validate_start, clean_name, normalize_phone, horizon, rub)
-from booking_flow import VERSION, STEPS, TITLES, prepare, require, first_missing, change_guests, callback
+from booking_flow import VERSION, prepare, require, first_missing, change_guests, callback, collected_fields, accept_field, booking_summary
 
 
 def kb(rows):
@@ -31,8 +31,9 @@ class BookingUI:
         self.router.callback_query.register(self.callback)
         self.locks = defaultdict(asyncio.Lock)
 
-    async def say(self, m, text, rows=None, photo=None, edit=False):
-        markup = kb(rows if rows is not None else nav())
+    async def say(self, m, text, rows=None, photo=None, edit=False, reply_markup=None):
+        markup = reply_markup if reply_markup is not None else kb(rows if rows is not None else nav())
+        if reply_markup is not None:edit=False
         file = Path(__file__).with_name('assets') / f'{photo}.jpg' if photo else None
         if edit and len(text) <= 1000:
             try:
@@ -68,6 +69,21 @@ class BookingUI:
             await self.store.save(actor, d, 'phone' if d['state']=='phone_contact' else 'profile_phone', d['data'])
             await m.answer('Выбор номера закрыт.', reply_markup=ReplyKeyboardRemove())
 
+    async def phone_screen(self,m,actor,d,text,profile=False,edit=False):
+        if edit and hasattr(m,'edit_reply_markup'):
+            try:await m.edit_reply_markup(reply_markup=None)
+            except TelegramBadRequest:pass
+        target='profile_contact' if profile else 'phone_contact'
+        if d['state']!=target:await self.store.save(actor,d,target,d['data'])
+        rows=[[KeyboardButton(text='📱 Поделиться номером',request_contact=True)]]
+        if not profile and d['data'].get('phone'):
+            rows.insert(0,[KeyboardButton(text='✓ Использовать '+d['data']['phone'])])
+        rows.append([KeyboardButton(text='← Назад')])
+        if not profile:rows.append([KeyboardButton(text='✕ Отменить оформление')])
+        rows.append([KeyboardButton(text='🏠 Главное меню')])
+        keyboard=ReplyKeyboardMarkup(keyboard=rows,resize_keyboard=True,one_time_keyboard=True)
+        await self.say(m,text+'\nПоделитесь номером кнопкой ниже или напишите его сообщением.',[],photo='booking',reply_markup=keyboard)
+
     async def home(self, m, actor=None, edit=False):
         actor = actor or m.from_user.id
         await self.leave_contact(m, actor)
@@ -85,7 +101,7 @@ class BookingUI:
     async def info(self, m, actor, section, back=None, edit=False):
         c = self.settings.content
         rows = []
-        if back: rows.append([('← К бронированию', back)])
+        if back: rows.append([('← Назад', back)])
         if section == 'Контакты':
             text = f'📍 Как нас найти\n\n{c["name"]}\nПосёлок Приладожское\n\n☎️ {c["phone"]}\nНестандартное время — по согласованию с администратором.'
             rows = [[('📍 Построить маршрут', c['map_url'])]] + rows
@@ -127,18 +143,20 @@ class BookingUI:
             await self.store.save(actor, d, state, data)
             d = await self.store.draft(actor, d['token'])
         state, data = d['state'], d['data']
-        if state in ('phone_contact', 'profile_contact'):
-            state = 'phone' if state=='phone_contact' else 'profile_phone'
+        if '_filled' not in data:
+            data['_filled']=collected_fields(state,data)
             await self.store.save(actor,d,state,data)
-            await m.answer('Можно ввести номер вручную.',reply_markup=ReplyKeyboardRemove())
             d=await self.store.draft(actor,d['token'])
+        if state in ('phone_contact','profile_contact'):
+            state='phone' if state=='phone_contact' else 'profile_phone'
         b = lambda action, value='': callback(action, d, value)
         if state.startswith('profile_'):
             key='name' if state=='profile_name' else 'phone'
             text='👤 Мои данные\n\n'+('Введите новое имя.' if key=='name' else 'Введите телефон для будущих бронирований.\nНапример: +7 981 244-00-50')
             rows=[]
-            if key=='phone':rows.append([('📱 Поделиться моим номером',b('share','profile'))])
-            rows.append([('← Отменить изменение','profilecancel')])
+            if key=='phone':
+                await self.phone_screen(m,actor,d,'👤 Мои данные\n\nУкажите телефон для будущих бронирований.',profile=True,edit=edit);return
+            rows.append([('← Назад','profilecancel')])
             await self.say(m,text,rows+nav(),edit=edit)
             return
         try: require(data, state)
@@ -148,24 +166,20 @@ class BookingUI:
             await self.store.save(actor,d,state,data)
             d=await self.store.draft(actor,d['token'])
             b=lambda action,value='':callback(action,d,value)
-        step=f'{STEPS.index(state)+1} из 6 · {TITLES[state]}'
-        heading='Ваше бронирование\n'+step+'\n\n'
+        heading=booking_summary(data,exclude=('guests',) if state=='guests' else ())
         footer=[[('✕ Отменить оформление',b('discardask'))]]+nav()
         if state=='name':
-            rows=[]
+            rows=[[('← Назад',b('back','review') if data.get('editing') and data.get('start') else 'home')]]
             if data.get('name'):rows.append([(f'✓ {data["name"]}',b('keep','name'))])
             await self.say(m,heading+'Как к вам обращаться?\nНапишите имя.',rows+footer,photo='booking',edit=edit)
         elif state=='phone':
-            rows=[]
-            if data.get('phone'):rows.append([(f'✓ {data["phone"]}',b('keep','phone'))])
-            rows += [[('📱 Поделиться моим номером',b('share'))], [('← Имя',b('back','name'))]]
-            await self.say(m,heading+'Укажите телефон для связи.\n\nМожно поделиться номером Telegram с вашего разрешения или написать другой.\nНапример: +7 981 244-00-50',rows+footer,photo='booking',edit=edit)
+            await self.phone_screen(m,actor,d,heading+'Укажите телефон для связи.',edit=edit)
         elif state=='guests':
             paid=data['guests']-data['children'];kids=data['children']
             def count_button(category,delta,enabled):return ('−' if delta<0 else '+',b('guest',category+('+' if delta>0 else '-')) if enabled else b('limit','min' if delta<0 else 'max'))
             rows=[[count_button('paid',-1,paid>0 and data['guests']>1),(f'От 7 лет: {paid}',b('noop')),count_button('paid',1,data['guests']<8)],
                   [count_button('kid',-1,kids>0 and data['guests']>1),(f'До 6 лет: {kids}',b('noop')),count_button('kid',1,data['guests']<8)],
-                  [('Далее · дата →',b('next','date'))],[('← Телефон',b('back','phone'))]]
+                  [('Далее · дата →',b('next','date'))],[('← Назад',b('back','phone'))]]
             text=f'Кол-во гостей: {data["guests"]}\n\nГости старше 7 лет: {paid}\nВ расчёт входят гости от 7 лет включительно.\n\nДети до 6 лет включительно: {kids}\n\nПростыни включены: {data["guests"]} шт.'
             await self.say(m,heading+text,rows+footer,photo='guests',edit=edit)
         elif state=='date':
@@ -183,7 +197,7 @@ class BookingUI:
                 target=(month-timedelta(days=1)).replace(day=1) if delta<0 else (month+timedelta(days=32)).replace(day=1)
                 if today.replace(day=1)<=target<=last.replace(day=1):paging.append((label,b('month',target.isoformat())))
             if paging:rows.append(paging)
-            rows += [[('← Гости',b('back','guests'))]]
+            rows += [[('← Назад',b('back','guests'))]]
             await self.say(m,heading+'Выберите день в календаре.\nВремя — по Москве.\nОдна бронь на дату, не более двух действующих.',rows+footer,photo='date',edit=edit)
         elif state=='slot':
             day=date.fromisoformat(data['day']);rows=[]
@@ -192,8 +206,8 @@ class BookingUI:
                 try: available=await self.store.free(start)
                 except RuleError:continue
                 if available:rows.append([(f'🕒 {hour:02}:00–{(hour+2)%24:02}:00',b('slot',str(hour)))])
-            text=f'{day:%d.%m.%Y}\n\n'+('Выберите удобное время · 2 часа.' if rows else 'Свободных сеансов нет.\nВыберите другую дату.')
-            rows += [[('↻ Обновить время',b('refresh'))],[('← Другая дата',b('back','date'))],[('☎️ Другое время','contact')]]
+            text='Выберите удобное время · 2 часа.' if rows else 'Свободных сеансов нет.\nВыберите другую дату.'
+            rows += [[('↻ Обновить время',b('refresh'))],[('← Назад',b('back','date'))],[('☎️ Другое время','contact')]]
             await self.say(m,heading+text,rows+footer,photo='time',edit=edit)
         elif state=='review':
             catalog,holidays=await self.store.pricing()
@@ -211,15 +225,14 @@ class BookingUI:
             await self.store.save(actor,d,'review',data)
             d=await self.store.draft(actor,d['token']);b=lambda action,value='':callback(action,d,value)
             start=datetime.fromisoformat(data['start']);end=start+timedelta(hours=2)
-            text=(f'Ваше бронирование\n\n📅 {start:%d.%m.%Y} · {start:%H:%M}–{end:%H:%M}\nВремя московское\n'
-                  f'👤 {data["name"]}\n📱 {data["phone"]}\n\nГостей: {data["guests"]}\nОт 7 лет: {data["guests"]-data["children"]} · дети до 6 лет: {data["children"]}\n'
-                  f'Простыни включены: {data["guests"]} шт.\n\nАренда: {rub(q["rent"])}\n')
+            text=booking_summary(data)+f'Простыни включены: {data["guests"]} шт.\n\nАренда: {rub(q["rent"])}\n'
             if q['guest_extra']:text+=f'Доплата за гостей: {rub(q["guest_extra"])}\n'
             text+=f'Итого: {rub(q["total"])}\n\nОплата на месте · без предоплаты.\nЗаявку подтвердит администратор.'
             if start-datetime.now(TZ)<timedelta(hours=24):text+='\nДо начала менее суток: после подтверждения отмена только через администратора.'
             rows=[[(('☑' if data.get('consent') else '☐')+' Принимаю правила',b('consent')),('📖 Правила',b('rules'))]]
             if data.get('consent'):rows.insert(0,[('✅ Подтвердить бронирование',b('submit'))])
             rows.append([('✏️ Изменить данные',b('editmenu'))])
+            rows.append([('← Назад',b('back','slot'))])
             await self.say(m,text,rows+footer,photo='booking',edit=edit)
 
     async def listing(self,m,actor,history=False,offset=0,edit=False):
@@ -237,7 +250,7 @@ class BookingUI:
     async def show(self,m,actor,ident,edit=False):
         r=await self.store.get(actor,ident);rows=[]
         if can_cancel(r['status'],r['starts_at'],datetime.now(TZ)):rows.append([('Отменить бронирование','cancelask:'+ident)])
-        rows += [[('☎️ Администратор','contact')],[('← Мои бронирования','list:0:0' if r['status'] in ('pending','confirmed') else 'list:1:0')]]
+        rows += [[('☎️ Администратор','contact')],[('← Назад','list:0:0' if r['status'] in ('pending','confirmed') else 'list:1:0')]]
         await self.say(m,card(r),rows+nav(),photo='booking',edit=edit)
 
     async def admin_link(self,m,actor):
@@ -254,7 +267,7 @@ class BookingUI:
 
     async def profile(self,m,actor,edit=False):
         p=await self.store.profile(actor)
-        await self.say(m,('👤 Мои данные\n\n'+p['name']+'\n'+p['phone'] if p else '👤 Мои данные\n\nПока не сохранены.')+'\n\nТолько для будущих бронирований.',[[('✏️ Изменить данные','profileedit')],[('← Мои бронирования','list:0:0')]]+nav(),edit=edit)
+        await self.say(m,('👤 Мои данные\n\n'+p['name']+'\n'+p['phone'] if p else '👤 Мои данные\n\nПока не сохранены.')+'\n\nТолько для будущих бронирований.',[[('✏️ Изменить данные','profileedit')],[('← Назад','list:0:0')]]+nav(),edit=edit)
 
     async def message(self,m):
         if m.chat.type!='private':return
@@ -265,7 +278,7 @@ class BookingUI:
     async def _message(self,m,actor):
         text=(m.text or '').strip()
         try:
-            if text in ('/start','/menu','Главное меню'):
+            if text in ('/start','/menu','Главное меню','🏠 Главное меню'):
                 await m.answer('Главное меню',reply_markup=ReplyKeyboardRemove())
                 await self.home(m,actor);return
             if text=='/id':await m.answer(str(actor));return
@@ -280,12 +293,22 @@ class BookingUI:
             state,data=d['state'],dict(d['data'])
             if data.get('flow_version')!=VERSION:
                 await self.render(m,actor,d);return
+            if '_filled' not in data:data['_filled']=collected_fields(state,data)
             profile=state.startswith('profile_')
+            if state in ('phone_contact','profile_contact') and text in ('← Назад','✕ Отменить оформление'):
+                await self.leave_contact(m,actor)
+                d=await self.store.draft(actor,d['token']);data=dict(d['data'])
+                if text=='✕ Отменить оформление':
+                    await self.say(m,'Отменить оформление?\n\nОтправленные бронирования сохранятся.',[[('Да, отменить оформление',callback('discard',d))],[('← Назад','resume')]]+nav());return
+                previous='profile_name' if profile else 'review' if data.pop('editing',False) and data.get('start') else 'name'
+                await self.store.save(actor,d,previous,data)
+                await self.render(m,actor,await self.store.draft(actor,d['token']));return
             if state in ('phone','phone_contact','profile_phone','profile_contact'):
                 contact=getattr(m,'contact',None)
                 if contact:
                     if contact.user_id!=actor:raise RuleError('Поделитесь своим номером или введите телефон вручную.')
                     phone=normalize_phone(contact.phone_number)
+                elif text=='✓ Использовать '+data.get('phone',''):phone=normalize_phone(data['phone'])
                 else:phone=normalize_phone(text)
                 if state.endswith('contact'):await m.answer('Номер получен.',reply_markup=ReplyKeyboardRemove())
                 if profile:
@@ -294,12 +317,14 @@ class BookingUI:
                     await self.store.save(actor,d,previous,data)
                     await self.profile(m,actor);return
                 data['phone']=phone
+                accept_field(data,'phone')
                 state='review' if data.pop('editing',False) and data.get('start') else 'guests'
             elif state in ('name','profile_name'):
                 name=clean_name(text)
                 if profile:data['profile_name']=name;state='profile_phone'
                 else:
                     data['name']=name
+                    accept_field(data,'name')
                     state='review' if data.pop('editing',False) and data.get('start') else 'phone'
             else:
                 await self.say(m,'На этом шаге выберите действие кнопкой.',[[('Продолжить','resume')]]+nav());return
@@ -326,7 +351,7 @@ class BookingUI:
                 await self.leave_contact(m,actor)
                 await self.say(m,'☎️ Администратор\n\n'+self.settings.content['phone']+'\n\nПозвоните по этому номеру.\nДля нестандартного времени согласуйте длительность заранее.',[[('📍 Маршрут',self.settings.content['map_url'])],[('← Назад','resume' if await self.unfinished(actor) else 'home')]]+nav(),edit=True);return
             if action=='rulesfull':
-                await self.say(m,self.settings.rules,[[('← К бронированию','resume')] if await self.unfinished(actor) else [('← Главное меню','home')]]+nav());return
+                await self.say(m,self.settings.rules,[[('← Назад','resume')] if await self.unfinished(actor) else [('← Назад','home')]]+nav());return
             if action=='info':
                 await self.leave_contact(m,actor);await self.info(m,actor,parts[1],edit=True);return
             if action=='list':await self.listing(m,actor,bool(int(parts[1])),int(parts[2]),edit=True);return
@@ -335,11 +360,11 @@ class BookingUI:
                 r=await self.store.legacy(actor,parts[1])
                 if not r:raise RuleError('Запись недоступна.')
                 data=r['data'];text=f'Прежняя заявка № {r["id"]}\n{data.get("start", "")}\nГостей: {data.get("guests", "")}\n{data.get("name", "")}\n{data.get("phone", "")}\n\nАрхив прежней версии. Статус уточните у администратора.'
-                await self.say(m,text,[[('← История','list:1:0')]]+nav(),edit=True);return
+                await self.say(m,text,[[('← Назад','list:1:0')]]+nav(),edit=True);return
             if action=='cancelask':
                 r=await self.store.get(actor,parts[1])
                 if not can_cancel(r['status'],r['starts_at'],datetime.now(TZ)):raise RuleError('Самостоятельная отмена недоступна. Свяжитесь с администратором.')
-                await self.say(m,'Отменить бронирование?\n\n'+card(r)+'\n\nОсвободившееся время могут занять другие гости.',[[('Да, отменить','cancel:'+parts[1])],[('← Сохранить бронь','open:'+parts[1])]]+nav(),edit=True);return
+                await self.say(m,'Отменить бронирование?\n\n'+card(r)+'\n\nОсвободившееся время могут занять другие гости.',[[('Да, отменить','cancel:'+parts[1])],[('← Назад','open:'+parts[1])]]+nav(),edit=True);return
             if action=='cancel':await self.store.transition(actor,parts[1],'cancel');await self.show(m,actor,parts[1],edit=True);return
             if action=='profile':await self.leave_contact(m,actor);await self.profile(m,actor,edit=True);return
             if action=='profileedit':
@@ -371,41 +396,43 @@ class BookingUI:
                 await self.say(m,'Экран уже изменился.\nПродолжите с актуального шага.',[[('Продолжить','resume')]]+nav());return
             state,data=d['state'],dict(d['data']);new=state
             if action in ('noop','limit'):
-                if action=='limit':await self.say(m,'Вместимость — до 8 гостей вместе с детьми.' if value=='max' else 'Укажите хотя бы одного гостя.',[[('← К гостям','resume')]]+nav())
+                if action=='limit':await self.say(m,'Вместимость — до 8 гостей вместе с детьми.' if value=='max' else 'Укажите хотя бы одного гостя.',[[('← Назад','resume')]]+nav())
                 return
+            if action in ('discardask','resetask','discard','reset') and state in ('phone_contact','profile_contact'):
+                await self.leave_contact(m,actor);d=await self.store.draft(actor,token);data=dict(d['data'])
             if action=='discardask':
-                await self.say(m,'Отменить оформление?\n\nОтправленные бронирования сохранятся.',[[('Да, отменить оформление',callback('discard',d))],[('← Продолжить','resume')]]+nav(),edit=True);return
+                await self.say(m,'Отменить оформление?\n\nОтправленные бронирования сохранятся.',[[('Да, отменить оформление',callback('discard',d))],[('← Назад','resume')]]+nav(),edit=True);return
             if action=='discard':
                 await self.store.abandon_draft(actor,d)
                 await self.home(m,actor,edit=True);return
             if action=='resetask':
-                await self.say(m,'Начать заново?\n\nТолько незавершённый черновик будет сброшен. Отправленные брони сохранятся.',[[('Начать заново',callback('reset',d))],[('← Продолжить', 'resume')]]+nav(),edit=True);return
+                await self.say(m,'Начать заново?\n\nТолько незавершённый черновик будет сброшен. Отправленные брони сохранятся.',[[('Начать заново',callback('reset',d))],[('← Назад', 'resume')]]+nav(),edit=True);return
             if action=='reset':
                 await self.store.reset_draft(actor,d)
                 await self.render(m,actor,await self.store.draft(actor),edit=True);return
             if action=='resume_step':await self.render(m,actor,d,edit=True);return
             if action=='editmenu' and state=='review':
-                rows=[[('👤 Имя',callback('edit',d,'name')),('📱 Телефон',callback('edit',d,'phone'))],[('👥 Гости',callback('edit',d,'guests'))],[('📅 Дата',callback('edit',d,'date')),('🕒 Время',callback('edit',d,'slot'))],[('← К проверке','resume')]]
+                rows=[[('👤 Имя',callback('edit',d,'name')),('📱 Телефон',callback('edit',d,'phone'))],[('👥 Гости',callback('edit',d,'guests'))],[('📅 Дата',callback('edit',d,'date')),('🕒 Время',callback('edit',d,'slot'))],[('← Назад','resume')]]
                 await self.say(m,'✏️ Что изменить?\n\nОстальные данные сохранятся.',rows+nav(),edit=True);return
             if action=='rules' and state=='review':
                 await self.info(m,actor,'Правила',back='resume',edit=True);return
-            if action=='share' and state in ('phone','profile_phone'):
-                await self.store.save(actor,d,'profile_contact' if state=='profile_phone' else 'phone_contact',data)
-                keyboard=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='📱 Поделиться моим номером',request_contact=True)],[KeyboardButton(text='Главное меню')]],resize_keyboard=True,one_time_keyboard=True)
-                await m.answer('Разрешаете использовать ваш номер Telegram для связи по бронированию?\n\nНажмите кнопку ниже или напишите другой номер.',reply_markup=keyboard)
-                return
+            if action=='share' and state in ('phone','profile_phone','phone_contact','profile_contact'):
+                await self.render(m,actor,d,edit=True);return
             if action in ('back','edit'):
-                require(data,value)
-                new=value
+                if state in ('phone_contact','profile_contact'):
+                    await self.leave_contact(m,actor);d=await self.store.draft(actor,token);data=dict(d['data'])
+                target='review' if action=='back' and data.get('editing') and data.get('start') else value
+                require(data,target)
+                new=target
                 if action=='edit':data['editing']=True
                 else:data.pop('editing',None)
             elif action=='keep' and ((value=='name' and state=='name') or (value=='phone' and state=='phone')):
-                if value=='name':data['name']=clean_name(data.get('name',''));new='phone'
-                else:data['phone']=normalize_phone(data.get('phone',''));new='guests'
+                if value=='name':data['name']=clean_name(data.get('name',''));accept_field(data,'name');new='phone'
+                else:data['phone']=normalize_phone(data.get('phone',''));accept_field(data,'phone');new='guests'
                 if data.pop('editing',False) and data.get('start'):new='review'
             elif action=='guest' and state=='guests':data=change_guests(data,value[:-1],1 if value.endswith('+') else -1)
             elif action=='next' and state=='guests' and value=='date':
-                require(data,'date');new='review' if data.pop('editing',False) and data.get('start') else 'date'
+                accept_field(data,'guests');require(data,'date');new='review' if data.pop('editing',False) and data.get('start') else 'date'
             elif action=='month' and state=='date':
                 month=date.fromisoformat(value)
                 today=datetime.now(TZ).date()
@@ -416,7 +443,7 @@ class BookingUI:
                 if not today<=day<=horizon(today):raise RuleError('Выберите доступную дату.')
                 if any(r['starts_at'].astimezone(TZ).date()==day for r in await self.store.listing(actor)):raise RuleError('На эту дату у вас уже есть бронь.')
                 if data.get('day')!=value:data.pop('start',None)
-                data['day']=value;new='slot'
+                data['day']=value;accept_field(data,'day');new='slot'
             elif action=='refresh' and state=='slot':pass
             elif action=='slot' and state=='slot':
                 hour=int(value)
@@ -424,7 +451,7 @@ class BookingUI:
                 start=datetime.combine(date.fromisoformat(data['day']),datetime.min.time(),TZ)+timedelta(hours=hour)
                 validate_start(start,datetime.now(TZ))
                 if not await self.store.free(start):raise RuleError('Это время уже занято. Обновите список сеансов.')
-                data['start']=start.isoformat();data.pop('editing',None);new='review'
+                data['start']=start.isoformat();accept_field(data,'start');data.pop('editing',None);new='review'
             elif action=='consent' and state=='review':data['consent']=not data.get('consent',False)
             else:raise RuleError('Кнопка недоступна на этом шаге. Продолжите бронирование.')
             if action!='consent':data['consent']=False
