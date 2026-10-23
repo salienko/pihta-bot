@@ -11,6 +11,7 @@ from aiogram.exceptions import TelegramBadRequest
 from booking_domain import (TZ, SLOTS, LABELS, RuleError, estimate, card, can_cancel,
                             validate_start, clean_name, normalize_phone, horizon, rub)
 from booking_flow import VERSION, prepare, require, first_missing, change_guests, callback, collected_fields, accept_field
+from booking_payments import total as payment_total
 
 
 def kb(rows):
@@ -112,8 +113,8 @@ class BookingUI:
             rows = [[('📍 Построить маршрут', c['map_url'])]] + rows
         elif section == 'Правила':
             text = ('📖 Правила бронирования\n\nДо 8 гостей вместе с детьми.\nДети до 7 лет включительно — без доплаты.\nПростыня на каждого гостя включена.\n\n'
-                    'Без предоплаты. Расчёт на месте до начала.\n\nЗаявка занимает время и ждёт решения администратора.\n'
-                    'Ожидающую заявку можно отменить в любое время. Подтверждённую — не позднее чем за 24 часа. Позже — через администратора.\n\n'
+                    'Для подтверждения внесите предоплату 2 000 ₽ или всю стоимость. Остаток — до начала сеанса.\n\nЗаявка занимает время и ждёт решения администратора.\n'
+                    'Неоплаченную ожидающую заявку можно отменить самостоятельно. Подтверждённую или оплаченную отменяет администратор по вашему запросу.\n\n'
                     'Отправленную бронь нельзя изменить: отмените её и создайте новую. Опоздание не продлевает сеанс.\n\n'
                     'Не более двух действующих броней на разные даты. Запись за час — два месяца до сеанса.')
             rows.insert(0,[('📄 Полные правила','rulesfull')])
@@ -252,7 +253,15 @@ class BookingUI:
 
     async def show(self,m,actor,ident,edit=False):
         r=await self.store.get(actor,ident);rows=[]
-        if can_cancel(r['status'],r['starts_at'],datetime.now(TZ)):rows.append([('Отменить бронирование','cancelask:'+ident)])
+        if r['status'] in ('pending','confirmed') and r['paid']<payment_total(r):
+            if not r['paid']:
+                rows += [[('💳 Внести предоплату 2 000 ₽','payrequest:deposit:'+ident)],
+                         [('💳 Оплатить полностью — '+rub(payment_total(r)),'payrequest:full:'+ident)]]
+            else:rows.append([('💳 Оплатить остаток — '+rub(payment_total(r)-r['paid']),'payrequest:balance:'+ident)])
+            requests=await self.store.payment_requests(actor,ident)
+            linked=next((req for req in requests if req['url']),None)
+            if linked:rows += [[('🔗 Перейти к оплате',linked['url'])],[('✅ Уже оплатил','payreport:'+linked['id'])]]
+        if r['status'] in ('pending','confirmed'):rows.append([('Отменить бронирование','cancelask:'+ident)])
         rows += [[('☎️ Администратор','contact')],[('← Назад','list:0:0' if r['status'] in ('pending','confirmed') else 'list:1:0')]]
         await self.say(m,card(r),rows+nav(),photo='booking',edit=edit)
 
@@ -281,6 +290,15 @@ class BookingUI:
     async def _message(self,m,actor):
         text=(m.text or '').strip()
         try:
+            reply=getattr(m,'reply_to_message',None)
+            if actor in self.settings.admin_ids and reply:
+                known=await self.store.pool.fetchval('SELECT request_id FROM payment_messages WHERE chat_id=$1 AND message_id=$2',actor,reply.message_id)
+                if known:
+                    url=text
+                    for entity in getattr(m,'entities',None) or []:
+                        if str(entity.type)=='text_link' and entity.url:url=entity.url;break
+                    await self.store.link_payment(actor,reply.message_id,url)
+                    await m.answer('🔗 Ссылка передана гостю. После проверки поступления нажмите кнопку подтверждения в запросе.');return
             if text in ('/start','/menu','Главное меню','🏠 Главное меню'):
                 await m.answer('Главное меню',reply_markup=ReplyKeyboardRemove())
                 await self.home(m,actor);return
@@ -347,6 +365,19 @@ class BookingUI:
         actor,m=c.from_user.id,c.message
         parts=(c.data or '').split(':');action=parts[0]
         try:
+            if action=='payrequest':
+                req,created=await self.store.request_payment(actor,parts[2],parts[1])
+                await self.show(m,actor,parts[2],edit=True)
+                await m.answer('Запрос ссылки передан администратору.' if created else 'Запрос уже передан администратору. Ожидайте ссылку.');return
+            if action=='payreport':
+                ident,created=await self.store.report_payment(actor,parts[1])
+                await self.show(m,actor,ident,edit=True)
+                await m.answer('Администратор получил ваше обращение и скоро ответит.');return
+            if action=='paystaff':
+                if parts[1] not in ('yes','no'):raise RuleError('Неизвестное действие.')
+                ident,changed=await self.store.decide_payment(actor,parts[2],parts[1]=='yes')
+                await m.answer(('✅ Поступление денег подтверждено.' if parts[1]=='yes' else 'Гостю передано: поступление пока не найдено.') if changed else 'Это решение уже учтено.')
+                await self.say(m,card(await self.store.get(actor,ident,staff=True)),[[('🔐 Веб-панель','staffweb')]]);return
             if action=='home':await self.home(m,actor,edit=True);return
             if action=='begin':await self.start(m,actor,edit=True);return
             if action=='staffweb':await self.admin_link(m,actor);return
@@ -366,9 +397,18 @@ class BookingUI:
                 await self.say(m,text,[[('← Назад','list:1:0')]]+nav(),edit=True);return
             if action=='cancelask':
                 r=await self.store.get(actor,parts[1])
+                if r['status']=='confirmed' or r['paid']:
+                    await self.store.request_cancellation(actor,parts[1])
+                    await m.answer('Ваш запрос передан администратору.')
+                    await self.show(m,actor,parts[1],edit=True);return
                 if not can_cancel(r['status'],r['starts_at'],datetime.now(TZ)):raise RuleError('Самостоятельная отмена недоступна. Свяжитесь с администратором.')
                 await self.say(m,'Отменить бронирование?\n\n'+card(r)+'\n\nОсвободившееся время могут занять другие гости.',[[('Да, отменить','cancel:'+parts[1])],[('← Назад','open:'+parts[1])]]+nav(),edit=True);return
-            if action=='cancel':await self.store.transition(actor,parts[1],'cancel');await self.show(m,actor,parts[1],edit=True);return
+            if action=='cancel':
+                r=await self.store.get(actor,parts[1])
+                if r['status']=='confirmed' or r['paid']:
+                    await self.store.request_cancellation(actor,parts[1]);await m.answer('Ваш запрос передан администратору.')
+                else:await self.store.transition(actor,parts[1],'cancel')
+                await self.show(m,actor,parts[1],edit=True);return
             if action=='profile':await self.leave_contact(m,actor);await self.profile(m,actor,edit=True);return
             if action=='profileedit':
                 token=await self.store.begin(actor);d=await self.store.draft(actor,token)
@@ -393,7 +433,7 @@ class BookingUI:
             action,token,revision,value=parts
             if action=='submit':
                 ident,created=await self.store.submit(actor,token,expected_revision=int(revision),accept_rules=True)
-                await self.say(m,'✅ Заявка отправлена\n\nВремя занято за вами.\nАдминистратор подтвердит или отклонит заявку.\nМы сообщим о решении здесь.' if created else 'Эта заявка уже отправлена.',[[('📋 Открыть бронирование','open:'+ident)]]+nav(),photo='booking',edit=True);return
+                await self.say(m,'✅ Заявка отправлена\n\nВремя занято за вами.\nДля подтверждения внесите предоплату 2 000 ₽ или всю стоимость.\nОткройте бронирование и запросите ссылку для оплаты.' if created else 'Эта заявка уже отправлена.',[[('📋 Открыть бронирование','open:'+ident)]]+nav(),photo='booking',edit=True);return
             d=await self.store.draft(actor,token)
             if d['revision']!=int(revision):
                 await self.say(m,'Экран уже изменился.\nПродолжите с актуального шага.',[[('Продолжить','resume')]]+nav());return

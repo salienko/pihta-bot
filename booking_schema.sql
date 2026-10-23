@@ -19,6 +19,15 @@ CREATE TABLE IF NOT EXISTS operations(key text PRIMARY KEY,actor bigint NOT NULL
 CREATE TABLE IF NOT EXISTS service_settings(code text PRIMARY KEY,available boolean NOT NULL);
 CREATE TABLE IF NOT EXISTS holiday_rates(day date PRIMARY KEY,label text NOT NULL,base bigint NOT NULL CHECK(base>0 AND base%2=0),extra bigint NOT NULL CHECK(extra>0));
 CREATE TABLE IF NOT EXISTS calendar_blocks(id bigserial PRIMARY KEY,starts_at timestamptz NOT NULL,ends_at timestamptz NOT NULL,reason text NOT NULL,actor bigint NOT NULL,active boolean NOT NULL DEFAULT true,CHECK(ends_at>starts_at));
+CREATE TABLE IF NOT EXISTS payment_requests(
+ id text PRIMARY KEY,booking_id text NOT NULL REFERENCES bookings(id),
+ kind text NOT NULL CHECK(kind IN ('deposit','full','balance')),
+ amount bigint NOT NULL CHECK(amount>0),paid_before bigint NOT NULL CHECK(paid_before>=0),
+ state text NOT NULL DEFAULT 'requested' CHECK(state IN ('requested','linked','reported','paid','superseded')),
+ url text NOT NULL DEFAULT '',revision integer NOT NULL DEFAULT 0,created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS payment_requests_booking ON payment_requests(booking_id,created_at);
+CREATE TABLE IF NOT EXISTS payment_messages(chat_id bigint NOT NULL,message_id bigint NOT NULL,request_id text NOT NULL REFERENCES payment_requests(id),PRIMARY KEY(chat_id,message_id));
 CREATE OR REPLACE FUNCTION protect_snapshot() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
  IF ROW(NEW.id,NEW.telegram_id,NEW.draft_token,NEW.starts_at,NEW.ends_at,NEW.blocked_until,NEW.data,NEW.estimate,NEW.rules_hash,NEW.created_at) IS DISTINCT FROM ROW(OLD.id,OLD.telegram_id,OLD.draft_token,OLD.starts_at,OLD.ends_at,OLD.blocked_until,OLD.data,OLD.estimate,OLD.rules_hash,OLD.created_at) THEN RAISE EXCEPTION 'booking snapshot is immutable'; END IF;

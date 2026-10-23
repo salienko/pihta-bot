@@ -30,7 +30,7 @@ class Policies(unittest.TestCase):
         with self.assertRaises(RuleError):estimate(self.data,self.catalog,{})
     def test_evening(self):self.data['start']='2026-10-28T19:00:00+03:00';self.assertEqual(estimate(self.data,self.catalog,{})['rent'],600000)
     def test_holiday(self):self.assertEqual(estimate(self.data,self.catalog,{'2026-10-28':{'base':650000}})['rent'],650000)
-    def test_exact_cancel_boundary(self):self.assertTrue(can_cancel('confirmed',self.clock+timedelta(hours=24),self.clock));self.assertFalse(can_cancel('confirmed',self.clock+timedelta(hours=24)-timedelta(microseconds=1),self.clock))
+    def test_confirmed_cancellation_always_requires_staff(self):self.assertFalse(can_cancel('confirmed',self.clock+timedelta(days=4),self.clock));self.assertFalse(can_cancel('confirmed',self.clock+timedelta(hours=23),self.clock))
     def test_pending_cancel_anytime(self):self.assertTrue(can_cancel('pending',self.clock-timedelta(hours=1),self.clock))
     def test_exact_hour(self):validate_start(self.clock+timedelta(hours=3),self.clock+timedelta(hours=2))
     def test_late_submission(self):
@@ -95,7 +95,7 @@ class Database(unittest.IsolatedAsyncioTestCase):
     async def test_cancel_release_and_history(self):
         ident=await self.book();await self.store.transition(2,ident,'cancel');self.assertTrue(await self.store.free(self.start));self.assertEqual((await self.store.get(2,ident))['status'],'cancelled');self.assertEqual(len(await self.store.listing(2,True)),1)
     async def test_confirmed_inside_day_rejects_cancel(self):
-        ident=await self.book();await self.store.transition(1,ident,'confirm',staff=True)
+        ident=await self.book();await self.store.accounting(1,ident,'deposit','payment',amount=200000,note='предоплата')
         with self.assertRaises(RuleError):await self.store.transition(2,ident,'cancel',clock=self.start-timedelta(hours=23))
     async def test_pending_inside_day_can_cancel(self):ident=await self.book();await self.store.transition(2,ident,'cancel',clock=self.start-timedelta(minutes=30))
     async def test_expire_cannot_confirm(self):
@@ -237,9 +237,10 @@ class Database(unittest.IsolatedAsyncioTestCase):
         rows=await self.store.listing(2)
         self.assertEqual(len(rows),1);self.assertEqual(rows[0]['data']['guests'],2)
         self.assertEqual(rows[0]['data']['cart'],{});self.assertEqual(rows[0]['status'],'pending')
-        await self.store.transition(1,rows[0]['id'],'confirm',staff=True)
+        await self.store.accounting(1,rows[0]['id'],'deposit','payment',amount=200000,note='предоплата')
         await self.click('cancel:'+rows[0]['id'],raw=True)
-        self.assertEqual((await self.store.get(2,rows[0]['id']))['status'],'cancelled')
+        self.assertEqual((await self.store.get(2,rows[0]['id']))['status'],'confirmed')
+        self.assertEqual(await self.store.pool.fetchval("SELECT count(*) FROM outbox WHERE event='cancel_requested'"),1)
 
     async def test_review_edit_and_return_requires_consent(self):
         await self.fill_journey();await self.click('consent')
@@ -327,7 +328,7 @@ class Database(unittest.IsolatedAsyncioTestCase):
 
     async def test_admin_filters_pending_separately_from_confirmed(self):
         first=await self.book(2);second=await self.book(3,1)
-        await self.store.transition(1,first,'confirm',staff=True)
+        await self.store.accounting(1,first,'deposit','payment',amount=200000,note='предоплата')
         rows=await self.store.listing(1,staff=True,status_filter='pending')
         self.assertEqual([r['id'] for r in rows],[second])
 

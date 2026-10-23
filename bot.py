@@ -24,7 +24,19 @@ async def deliver_once(bot,store):
             expected='pending' if ':pending:' in row['event'] else 'confirmed'
             if current!=expected:await store.delivered(row['id']);return True
         buttons=[[('Открыть веб-панель','staffweb')]] if row['recipient'] in store.settings.admin_ids else [[('Открыть бронь','open:'+row['booking_id'])]]
-        await bot.send_message(row['recipient'],row['text'],reply_markup=kb(buttons))
+        payment=await store.payment_delivery(row['event'])
+        if row['event'].startswith(('payreq:','paylink:','payreported:')) and not payment:
+            await store.delivered(row['id']);return True
+        if payment:
+            if row['event'].startswith('paylink:') and payment['url']:
+                buttons=[[('🔗 Перейти к оплате',payment['url'])],[('✅ Уже оплатил','payreport:'+payment['id'])],
+                         [('Открыть бронь','open:'+row['booking_id'])]]
+            elif row['recipient'] in store.settings.admin_ids:
+                buttons=[[('✅ Получено '+str(payment['amount']//100)+' ₽','paystaff:yes:'+payment['id'])],
+                         [('❌ Деньги не поступили','paystaff:no:'+payment['id'])]]+buttons
+        sent=await bot.send_message(row['recipient'],row['text'],reply_markup=kb(buttons))
+        if payment and not row['event'].startswith('paylink:') and row['recipient'] in store.settings.admin_ids:
+            await store.payment_message_delivered(payment['id'],row['recipient'],sent.message_id)
     except TelegramRetryAfter as e:await store.failed(row['id'],'rate_limit',e.retry_after)
     except TelegramForbiddenError:await store.failed(row['id'],'blocked_by_recipient',permanent=True)
     except Exception as e:await store.failed(row['id'],type(e).__name__,min(3600,5*2**min(row['attempts'],9)))

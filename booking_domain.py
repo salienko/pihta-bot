@@ -43,7 +43,7 @@ def estimate(data, catalog, holidays):
     return dict(rent=rent,guest_extra=extra,items=items,total=rent+extra+sum(i['total'] for i in items))
 
 def can_cancel(status, start, clock):
-    return status == 'pending' or (status == 'confirmed' and start-clock >= timedelta(hours=24))
+    return status == 'pending'
 
 def card(row, personal=True):
     d,q=row['data'],row['estimate']
@@ -60,6 +60,8 @@ def card(row, personal=True):
     actual=row.get('actual_total');total=actual if actual is not None else q['total']
     if actual is not None:lines.append('Фактический расчёт: '+rub(actual))
     paid=row.get('paid',0)
+    if paid>=total:lines.append('✅ Внесена вся стоимость')
+    elif paid>=200000:lines.append('✅ Внесена предоплата')
     if paid:lines.append('Оплачено: '+rub(paid))
     if row['status'] in ('cancelled','rejected','expired'):
         if paid:lines.append('Расчёт и возможный возврат — через администратора.')
@@ -71,5 +73,8 @@ def card(row, personal=True):
     if row['status']=='confirmed' and start<=datetime.now(TZ)<end:lines+=['','Сеанс идёт. Окончание по брони.']
     if personal:lines += ['',f"👤 {d['name']}",f"📱 {d['phone']}"]
     if row['status'] in ('pending','confirmed'):
-        lines += ['','После отправки бронь не редактируется.','Оплата на месте до начала.']
+        if not paid:
+            lines += ['','Для подтверждения бронирования необходимо внести предоплату 2 000 ₽ либо оплатить всю сумму сразу.','Получите ссылку для оплаты ↓']
+        elif paid<total:
+            lines += ['','Осталось доплатить: '+rub(total-paid),'Получите ссылку для оплаты ↓']
     return '\n'.join(lines)

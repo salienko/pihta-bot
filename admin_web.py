@@ -81,12 +81,12 @@ def make_app(store,settings,secure=True):
     async def detail(request):
         s=await auth(request);r=await store.get(s['actor'],request.match_info['id'],staff=True)
         body=navigation(s)+'<h1>Бронь № '+e(r['id'])+'</h1><div class="card"><pre>'+e(card(r))+'</pre></div>'
-        if r['status']=='pending':body+='<div class="card">'+form(s,'/booking/'+r['id']+'/confirm','<p>Подтвердить бронирование бани?</p>','Подтвердить бронирование')+'</div>'
+        if r['status']=='pending':body+='<div class="notice">Бронь подтвердится автоматически после фиксации поступления минимум 2 000 ₽ или всей стоимости. Ссылка и сообщение гостя «Уже оплатил» не являются подтверждением поступления.</div>'
         if r['status'] in ('pending','confirmed'):
             body+='<div class="card">'+form(s,'/booking/'+r['id']+'/cancel','<label>Причина отмены<textarea name="reason" minlength="2" maxlength="500" required></textarea></label>','Отменить с уведомлением',True)+'</div>'
             if r['status']=='pending':body+='<div class="card">'+form(s,'/booking/'+r['id']+'/reject','<label>Причина отказа<textarea name="reason" minlength="2" maxlength="500" required></textarea></label>','Отказать',True)+'</div>'
         body+='<div class="grid">'
-        for action,title in [('payment','Фактически принято на месте'),('refund','Фактически возвращено вручную')]:
+        for action,title in [('payment','Подтвердить поступление денег'),('refund','Фактически возвращено вручную')]:
             body+='<div class="card"><h2>'+title+'</h2>'+form(s,'/booking/'+r['id']+'/'+action,'<label>Сумма, ₽<input name="amount" type="number" min="0.01" max="1000000" step="0.01" required></label><label>Комментарий<input name="note" minlength="2" maxlength="500" required></label>','Зафиксировать факт')+'</div>'
         body+='</div><div class="card"><h2>Фактическое посещение — отдельно от брони</h2><p>Исходная сумма и состав сохраняются. Меньшее число гостей не снижает стоимость.</p>'+form(s,'/booking/'+r['id']+'/actual','<label>Фактических гостей<input name="guests" type="number" min="1" max="8" required></label><label>Итог фактического расчёта, ₽<input name="total" type="number" min="0" step="0.01" required></label><label>Обоснование расчёта<textarea name="note" minlength="2" maxlength="500" required></textarea></label>')+'</div>'
         body+='<div class="card"><h2>Связаться с гостем</h2><p>Уточните детали посещения. Сообщение не меняет бронь и занятость.</p>'+form(s,'/booking/'+r['id']+'/message','<label>Сообщение<textarea name="text" minlength="2" maxlength="1000" required></textarea></label>','Отправить гостю')+'</div>'

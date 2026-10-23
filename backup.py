@@ -10,7 +10,7 @@ import re
 import asyncpg
 from booking_store import SCHEMA
 
-TABLES = ('profiles','drafts','bookings','audit','outbox','operations','calendar_blocks','service_settings','holiday_rates')
+TABLES = ('profiles','drafts','bookings','audit','outbox','operations','calendar_blocks','service_settings','holiday_rates','payment_requests','payment_messages')
 
 
 async def snapshot(url, folder, schema=SCHEMA):

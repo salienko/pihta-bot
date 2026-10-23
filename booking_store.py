@@ -9,6 +9,7 @@ from pathlib import Path
 import asyncpg
 from booking_domain import TZ,RuleError,estimate,validate_start,can_cancel,card,clean_name,normalize_phone
 from booking_flow import VERSION,require
+from booking_payments import PaymentStore,DEPOSIT,total as payment_total
 
 SCHEMA='pihta_booking_v2'
 LOCK=7319845
@@ -20,7 +21,7 @@ def unpack(row):
         if key in d and isinstance(d[key],str):d[key]=json.loads(d[key])
     return d
 
-class BookingStore:
+class BookingStore(PaymentStore):
     def __init__(self,settings,pool):self.settings,self.pool=settings,pool
 
     @classmethod
@@ -201,10 +202,16 @@ class BookingStore:
             if row['status']==target:return
             if row['status'] not in ('pending','confirmed'):raise RuleError('Заявка уже закрыта.')
             if action in ('confirm','reject') and (not staff or row['status']!='pending'):raise RuleError('Действие недоступно.')
+            if action=='confirm' and row['paid']<min(DEPOSIT,payment_total(row)):raise RuleError('Сначала подтвердите поступление предоплаты или полной стоимости.')
+            if not staff and row['paid']:raise RuleError('Оплаченную бронь отменяет только администратор. Свяжитесь с ним для расчёта и возврата.')
+            if not staff and row['status']=='confirmed':raise RuleError('Подтверждённую бронь отменяет администратор. Отправьте запрос на отмену.')
             if not staff and (action!='cancel' or not can_cancel(row['status'],row['starts_at'],clock)):raise RuleError('До начала менее 24 часов. Свяжитесь с администратором.')
             if staff and action!='confirm' and not 2<=len(reason.strip())<=500:raise RuleError('Укажите причину от 2 до 500 символов.')
             await db.execute('UPDATE bookings SET status=$1,reason=$2,revision=revision+1 WHERE id=$3',target,reason.strip(),ident)
             await db.execute("UPDATE outbox SET disabled=true WHERE booking_id=$1 AND event LIKE 'reminder:%' AND delivered_at IS NULL",ident)
+            if target in ('cancelled','rejected'):
+                await db.execute("UPDATE payment_requests SET state='superseded',revision=revision+1 WHERE booking_id=$1 AND state IN ('requested','linked','reported')",ident)
+                await db.execute("UPDATE outbox SET disabled=true WHERE booking_id=$1 AND delivered_at IS NULL AND (event LIKE 'payreq:%' OR event LIKE 'paylink:%' OR event LIKE 'payreported:%')",ident)
             row.update(status=target,reason=reason.strip())
             await self.audit(db,ident,actor,action,{'reason':reason.strip()});await self.enqueue(db,row,'status:'+target,card(row))
 
@@ -213,7 +220,7 @@ class BookingStore:
         if kind not in ('payment','refund','actual','no_show'):raise RuleError('Неизвестное действие.')
         if not 2<=len(note.strip())<=500:raise RuleError('Укажите комментарий от 2 до 500 символов.')
         async with self.tx() as db:
-            if await db.fetchval('SELECT key FROM operations WHERE key=$1 AND actor=$2',key,actor):return
+            if await db.fetchval('SELECT key FROM operations WHERE key=$1',key):return
             row=unpack(await db.fetchrow('SELECT * FROM bookings WHERE id=$1 FOR UPDATE',ident))
             if not row:raise RuleError('Бронь не найдена.')
             if kind in ('payment','refund'):
@@ -221,13 +228,17 @@ class BookingStore:
                 paid=row['paid']+(amount if kind=='payment' else -amount)
                 if paid<0:raise RuleError('Возврат больше фактически внесённой суммы.')
                 await db.execute('UPDATE bookings SET paid=$1,revision=revision+1 WHERE id=$2',paid,ident)
+                if kind=='payment' and row['status']=='pending' and paid>=min(DEPOSIT,payment_total(row)):
+                    await db.execute("UPDATE bookings SET status='confirmed' WHERE id=$1",ident)
+                await db.execute("UPDATE payment_requests SET state='superseded',revision=revision+1 WHERE booking_id=$1 AND state IN ('requested','linked','reported')",ident)
+                await db.execute("UPDATE outbox SET disabled=true WHERE booking_id=$1 AND delivered_at IS NULL AND (event LIKE 'payreq:%' OR event LIKE 'paylink:%' OR event LIKE 'payreported:%')",ident)
             elif kind=='actual':
                 if type(guests) is not int or not 1<=guests<=8 or type(total) is not int or total<row['estimate']['total']:raise RuleError('1–8 гостей; сумма не меньше суммы исходной брони.')
                 await db.execute('UPDATE bookings SET actual_guests=$1,actual_total=$2,revision=revision+1 WHERE id=$3',guests,total,ident)
             else:
                 if row['starts_at']>await self.clock(db) or row['status'] not in ('confirmed','completed'):raise RuleError('Неявка отмечается после начала подтверждённого сеанса.')
                 await db.execute('UPDATE bookings SET no_show=true,revision=revision+1 WHERE id=$1',ident)
-            await self.audit(db,ident,actor,kind,dict(amount=amount,guests=guests,total=total,note=note))
+            await self.audit(db,ident,actor,kind,dict(amount=amount,guests=guests,total=total,note=note,payment_kind=('deposit' if not row['paid'] and amount==DEPOSIT else 'full' if not row['paid'] and amount>=payment_total(row) else 'balance' if row['paid'] else 'partial') if kind=='payment' else None))
             await db.execute('INSERT INTO operations VALUES($1,$2,$3)',key,actor,ident)
             updated=unpack(await db.fetchrow('SELECT * FROM bookings WHERE id=$1',ident))
             await self.enqueue(db,updated,'account:'+key,card(updated),[row['telegram_id']])
@@ -261,7 +272,7 @@ class BookingStore:
                     for hours in (24,1):
                         deadline=start-timedelta(hours=hours)
                         if row['created_at']<=deadline<=clock<deadline+timedelta(minutes=2):
-                            await self.enqueue(db,row,f'reminder:confirmed:{hours}',f"Напоминание: сеанс № {row['id']} {start.astimezone(TZ):%d.%m %H:%M}. Оплата на месте до начала.",[row['telegram_id']])
+                            await self.enqueue(db,row,f'reminder:confirmed:{hours}',f"Напоминание: сеанс № {row['id']} {start.astimezone(TZ):%d.%m %H:%M}. Остаток оплаты, если есть, внесите до начала сеанса.",[row['telegram_id']])
             await db.execute('DELETE FROM web_tokens WHERE expires_at<$1',clock)
             await db.execute('DELETE FROM web_sessions WHERE expires_at<$1',clock)
 
