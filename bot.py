@@ -9,6 +9,7 @@ from aiogram.exceptions import TelegramRetryAfter,TelegramForbiddenError
 from settings import load
 from booking_store import BookingStore
 from booking_ui import BookingUI,kb
+from booking_domain import rub
 from admin_web import make_app
 from bot_features import configured_features
 
@@ -32,7 +33,7 @@ async def deliver_once(bot,store):
                 buttons=[[('🔗 Перейти к оплате',payment['url'])],[('✅ Уже оплатил','payreport:'+payment['id'])],
                          [('Открыть бронь','open:'+row['booking_id'])]]
             elif row['recipient'] in store.settings.admin_ids:
-                buttons=[[('✅ Получено '+str(payment['amount']//100)+' ₽','paystaff:yes:'+payment['id'])],
+                buttons=[[('✅ Получено '+rub(payment['amount']),'paystaff:yes:'+payment['id'])],
                          [('❌ Деньги не поступили','paystaff:no:'+payment['id'])]]+buttons
         sent=await bot.send_message(row['recipient'],row['text'],reply_markup=kb(buttons))
         if payment and not row['event'].startswith('paylink:') and row['recipient'] in store.settings.admin_ids:
