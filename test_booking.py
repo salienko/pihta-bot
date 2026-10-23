@@ -334,41 +334,54 @@ class Database(unittest.IsolatedAsyncioTestCase):
     async def test_phone_sharing_is_available_on_first_card(self):
         self.make_ui();await self.click('begin',raw=True);await self.enter('Иван')
         call=self.ui.say.call_args
-        self.assertIn('Укажите телефон',call.args[1])
+        self.assertIn('Укажите ваш номер телефона',call.args[1])
         self.assertNotIn('Разрешаете',call.args[1])
         keyboard=call.kwargs['reply_markup']
         self.assertTrue(any(b.request_contact for row in keyboard.keyboard for b in row))
         self.assertFalse(any('share:' in value for row in call.args[2] for _,value in row))
-        self.assertIn('Иван',call.args[1]);self.assertNotRegex(call.args[1],r'\d из 6')
+        self.assertNotIn('Иван',call.args[1]);self.assertNotRegex(call.args[1],r'\d из 6')
 
     async def test_phone_back_saved_number_and_keyboard_departure(self):
         await self.store.profile(2,'Пётр','+79810000000')
-        self.make_ui();await self.click('begin',raw=True);await self.click('keep','name')
-        await self.enter('← Назад');d=await self.store.draft(2)
-        self.assertEqual(d['state'],'name')
-        self.assertTrue(self.m.answer.call_args.kwargs['reply_markup'].remove_keyboard)
-        await self.click('keep','name');await self.enter('✓ Использовать +79810000000')
+        self.make_ui();await self.click('begin',raw=True);await self.enter('Иван')
+        self.assertEqual((await self.store.draft(2))['state'],'phone')
+        self.assertIsNone(self.ui.say.call_args.kwargs.get('reply_markup'))
+        self.assertIn('📱 Использовать мой номер',str(self.ui.say.call_args.args[2]))
+        await self.click('back','name');self.assertEqual((await self.store.draft(2))['state'],'name')
+        await self.enter('Иван');await self.click('keep','phone')
         d=await self.store.draft(2)
         self.assertEqual(d['state'],'guests');self.assertEqual(d['data']['phone'],'+79810000000')
-        await self.click('back','phone');await self.click('home',raw=True)
-        self.assertTrue(self.m.answer.call_args.kwargs['reply_markup'].remove_keyboard)
 
-    async def test_accumulating_summary_hides_unaccepted_profile_defaults(self):
-        await self.store.profile(2,'Сохранённое имя','+79810000000')
+    async def test_only_current_question_until_review(self):
         self.make_ui();await self.click('begin',raw=True)
-        self.assertNotIn('👤 Имя:',self.ui.say.call_args.args[1])
-        self.assertNotIn('📱 Телефон:',self.ui.say.call_args.args[1])
-        await self.enter('Иван')
-        text=self.ui.say.call_args.args[1]
-        self.assertIn('👤 Имя: Иван',text);self.assertNotIn('📱 Телефон:',text)
-        await self.enter('+79812440050');await self.click('next','date')
-        text=self.ui.say.call_args.args[1]
-        for value in ('Иван','+79812440050','Кол-во гостей: 1'):self.assertIn(value,text)
-        await self.click('day',self.start.date().isoformat())
-        self.assertIn(self.start.strftime('%d.%m.%Y'),self.ui.say.call_args.args[1])
-        await self.click('slot','13');await self.click('edit','name');await self.enter('Пётр')
-        await self.click('back','slot')
-        self.assertIn('Пётр',self.ui.say.call_args.args[1]);self.assertNotIn('Иван',self.ui.say.call_args.args[1])
+        self.assertEqual(self.ui.say.call_args.args[2],[[('🏠 Главное меню','home')]])
+        await self.enter('Иван');self.assertNotIn('Иван',self.ui.say.call_args.args[1])
+        await self.enter('+79812440050');self.assertNotIn('+79812440050',self.ui.say.call_args.args[1])
+        await self.click('next','date');self.assertNotIn('Иван',self.ui.say.call_args.args[1])
+        await self.click('day',self.start.date().isoformat());await self.click('slot','13')
+        self.assertIn('Иван',self.ui.say.call_args.args[1])
+        labels=str(self.ui.say.call_args.args[2])
+        self.assertNotIn('Изменить данные',labels);self.assertNotIn('Принимаю правила',labels)
+        self.assertIn('Подтверждая бронирование',self.ui.say.call_args.args[1])
+        await self.click('submit')
+        rows=await self.store.listing(2)
+        self.assertEqual(len(rows),1);self.assertTrue(rows[0]['data']['consent'])
+        self.assertEqual(rows[0]['rules_hash'],self.settings.rules_hash)
+
+    async def test_calendar_hides_fully_blocked_day_not_partial_day(self):
+        day=self.start.date()
+        self.assertIn(day,await self.store.available_days([day]))
+        await self.book(3)
+        self.assertIn(day,await self.store.available_days([day]))
+        await self.store.pool.execute("INSERT INTO calendar_blocks(starts_at,ends_at,reason,actor) VALUES($1,$2,'test',1)",self.start.replace(hour=0),self.start.replace(hour=0)+timedelta(days=1))
+        self.assertNotIn(day,await self.store.available_days([day]))
+
+    async def test_submit_button_rechecks_changed_price_without_checkbox(self):
+        await self.fill_journey()
+        await self.store.pool.execute("INSERT INTO holiday_rates(day,label,base,extra) VALUES($1,'test',650000,300000)",self.start.date())
+        await self.click('submit')
+        self.assertEqual(await self.store.listing(2),[])
+        self.assertIn('Расчёт изменился',self.ui.say.call_args.args[1])
 
     async def test_uniform_back_labels_and_no_step_numbers(self):
         await self.fill_journey();await self.click('editmenu')

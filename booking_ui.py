@@ -10,7 +10,7 @@ from aiogram.types import (ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardBut
 from aiogram.exceptions import TelegramBadRequest
 from booking_domain import (TZ, SLOTS, LABELS, RuleError, estimate, card, can_cancel,
                             validate_start, clean_name, normalize_phone, horizon, rub)
-from booking_flow import VERSION, prepare, require, first_missing, change_guests, callback, collected_fields, accept_field, booking_summary
+from booking_flow import VERSION, prepare, require, first_missing, change_guests, callback, collected_fields, accept_field
 
 
 def kb(rows):
@@ -73,16 +73,21 @@ class BookingUI:
         if edit and hasattr(m,'edit_reply_markup'):
             try:await m.edit_reply_markup(reply_markup=None)
             except TelegramBadRequest:pass
+        if not profile and d['data'].get('phone'):
+            if d['state']=='phone_contact':
+                await self.leave_contact(m,actor)
+                d=await self.store.draft(actor,d['token'])
+            b=lambda action,value='':callback(action,d,value)
+            await self.say(m,text,[[('📱 Использовать мой номер',b('keep','phone'))],[('← Назад',b('back','name'))],[('✖ Отменить оформление',b('discardask'))]]+nav(),photo='booking',edit=edit)
+            return
         target='profile_contact' if profile else 'phone_contact'
         if d['state']!=target:await self.store.save(actor,d,target,d['data'])
         rows=[[KeyboardButton(text='📱 Поделиться номером',request_contact=True)]]
-        if not profile and d['data'].get('phone'):
-            rows.insert(0,[KeyboardButton(text='✓ Использовать '+d['data']['phone'])])
         rows.append([KeyboardButton(text='← Назад')])
-        if not profile:rows.append([KeyboardButton(text='✕ Отменить оформление')])
+        if not profile:rows.append([KeyboardButton(text='✖ Отменить оформление')])
         rows.append([KeyboardButton(text='🏠 Главное меню')])
         keyboard=ReplyKeyboardMarkup(keyboard=rows,resize_keyboard=True,one_time_keyboard=True)
-        await self.say(m,text+'\nПоделитесь номером кнопкой ниже или напишите его сообщением.',[],photo='booking',reply_markup=keyboard)
+        await self.say(m,text,[],photo='booking',reply_markup=keyboard)
 
     async def home(self, m, actor=None, edit=False):
         actor = actor or m.from_user.id
@@ -106,7 +111,7 @@ class BookingUI:
             text = f'📍 Как нас найти\n\n{c["name"]}\nПосёлок Приладожское\n\n☎️ {c["phone"]}\nНестандартное время — по согласованию с администратором.'
             rows = [[('📍 Построить маршрут', c['map_url'])]] + rows
         elif section == 'Правила':
-            text = ('📖 Правила бронирования\n\nДо 8 гостей вместе с детьми.\nДети до 6 лет включительно — без доплаты.\nПростыня на каждого гостя включена.\n\n'
+            text = ('📖 Правила бронирования\n\nДо 8 гостей вместе с детьми.\nДети до 7 лет включительно — без доплаты.\nПростыня на каждого гостя включена.\n\n'
                     'Без предоплаты. Расчёт на месте до начала.\n\nЗаявка занимает время и ждёт решения администратора.\n'
                     'Ожидающую заявку можно отменить в любое время. Подтверждённую — не позднее чем за 24 часа. Позже — через администратора.\n\n'
                     'Отправленную бронь нельзя изменить: отмените её и создайте новую. Опоздание не продлевает сеанс.\n\n'
@@ -114,7 +119,7 @@ class BookingUI:
             rows.insert(0,[('📄 Полные правила','rulesfull')])
         elif section in ('Цены', 'Цены и услуги'):
             text = ('💰 Аренда бани · 2 часа\n\nПн–пт до 19:00 — 5 000 ₽\nС 19:00 и в выходные — 6 000 ₽\nПраздничные даты — 6 500 ₽*\n\n'
-                    'Включены 4 гостя от 7 лет.\nЗа каждого следующего — 250 ₽/час.\nДети до 6 лет включительно — бесплатно.\n\n'
+                    'Включены 4 гостя от 8 лет.\nЗа каждого следующего — 250 ₽/час.\nДети до 7 лет включительно — бесплатно.\n\n'
                     'Точная сумма будет перед отправкой.\n*Особые даты и нестандартная длительность — через администратора.')
             rows = [[('📅 Забронировать', 'begin')]] + rows
         else:
@@ -166,22 +171,22 @@ class BookingUI:
             await self.store.save(actor,d,state,data)
             d=await self.store.draft(actor,d['token'])
             b=lambda action,value='':callback(action,d,value)
-        heading=booking_summary(data,exclude=('guests',) if state=='guests' else ())
-        footer=[[('✕ Отменить оформление',b('discardask'))]]+nav()
+        heading=''
+        footer=[[('✖ Отменить оформление',b('discardask'))]]+nav()
         if state=='name':
-            rows=[[('← Назад',b('back','review') if data.get('editing') and data.get('start') else 'home')]]
-            if data.get('name'):rows.append([(f'✓ {data["name"]}',b('keep','name'))])
-            await self.say(m,heading+'Как к вам обращаться?\nНапишите имя.',rows+footer,photo='booking',edit=edit)
+            await self.say(m,'👤 Как к Вам обращаться?\n\nНапишите Ваше имя ↓',nav(),photo='booking',edit=edit)
         elif state=='phone':
-            await self.phone_screen(m,actor,d,heading+'Укажите телефон для связи.',edit=edit)
+            await self.phone_screen(m,actor,d,'📱 Как с вами связаться?\n\nУкажите ваш номер телефона ↓',edit=edit)
         elif state=='guests':
             paid=data['guests']-data['children'];kids=data['children']
             def count_button(category,delta,enabled):return ('−' if delta<0 else '+',b('guest',category+('+' if delta>0 else '-')) if enabled else b('limit','min' if delta<0 else 'max'))
-            rows=[[count_button('paid',-1,paid>0 and data['guests']>1),(f'От 7 лет: {paid}',b('noop')),count_button('paid',1,data['guests']<8)],
-                  [count_button('kid',-1,kids>0 and data['guests']>1),(f'До 6 лет: {kids}',b('noop')),count_button('kid',1,data['guests']<8)],
-                  [('Далее · дата →',b('next','date'))],[('← Назад',b('back','phone'))]]
-            text=f'Кол-во гостей: {data["guests"]}\n\nГости старше 7 лет: {paid}\nВ расчёт входят гости от 7 лет включительно.\n\nДети до 6 лет включительно: {kids}\n\nПростыни включены: {data["guests"]} шт.'
-            await self.say(m,heading+text,rows+footer,photo='guests',edit=edit)
+            rows=[[('Гости старше 7 лет',b('noop'))],
+                  [count_button('paid',-1,paid>0 and data['guests']>1),(f'{paid} чел.',b('noop')),count_button('paid',1,data['guests']<8)],
+                  [('Гости младше 7 лет',b('noop'))],
+                  [count_button('kid',-1,kids>0 and data['guests']>1),(f'{kids} чел.',b('noop')),count_button('kid',1,data['guests']<8)],
+                  [('📅 Выбрать дату',b('next','date'))],[('← Назад',b('back','phone'))]]
+            text=f'👥 Уточните какое кол-во гостей планирует отдыхать?\n\nВсего гостей: {data["guests"]} чел.\n\nУкажите кол-во гостей ↓'
+            await self.say(m,text,rows+footer,photo='guests',edit=edit)
         elif state=='date':
             today=datetime.now(TZ).date();last=horizon(today)
             month=date.fromisoformat(data.get('month',today.replace(day=1).isoformat()))
@@ -190,24 +195,24 @@ class BookingUI:
             rows=[[(f'{months[month.month-1]} {month.year}',b('noop'))],[(day,b('noop')) for day in ('Пн','Вт','Ср','Чт','Пт','Сб','Вс')]]
             active=await self.store.listing(actor)
             occupied={r['starts_at'].astimezone(TZ).date() for r in active}
-            for week in calendar.Calendar().monthdatescalendar(month.year,month.month):
-                rows.append([(str(day.day),b('day',day.isoformat())) if day.month==month.month and today<=day<=last and day not in occupied else ('·',b('noop')) for day in week])
-            paging=[]
-            for delta,label in ((-1,'‹ Месяц'),(1,'Месяц ›')):
-                target=(month-timedelta(days=1)).replace(day=1) if delta<0 else (month+timedelta(days=32)).replace(day=1)
-                if today.replace(day=1)<=target<=last.replace(day=1):paging.append((label,b('month',target.isoformat())))
-            if paging:rows.append(paging)
+            weeks=calendar.Calendar().monthdatescalendar(month.year,month.month)
+            available_days=await self.store.available_days([day for week in weeks for day in week if day.month==month.month and today<=day<=last])
+            for week in weeks:
+                rows.append([(str(day.day),b('day',day.isoformat())) if day.month==month.month and today<=day<=last and day not in occupied and day in available_days else ('·',b('noop')) for day in week])
+            target=(month+timedelta(days=32)).replace(day=1)
+            if target>last.replace(day=1):target=today.replace(day=1)
+            if target!=month:rows.append([('Месяц >',b('month',target.isoformat()))])
             rows += [[('← Назад',b('back','guests'))]]
-            await self.say(m,heading+'Выберите день в календаре.\nВремя — по Москве.\nОдна бронь на дату, не более двух действующих.',rows+footer,photo='date',edit=edit)
+            await self.say(m,'📅 Выберите удобную дату\n\nВыберите день в календаре ↓',rows+footer,photo='date',edit=edit)
         elif state=='slot':
             day=date.fromisoformat(data['day']);rows=[]
             for hour in SLOTS:
                 start=datetime.combine(day,datetime.min.time(),TZ)+timedelta(hours=hour)
                 try: available=await self.store.free(start)
                 except RuleError:continue
-                if available:rows.append([(f'🕒 {hour:02}:00–{(hour+2)%24:02}:00',b('slot',str(hour)))])
-            text='Выберите удобное время · 2 часа.' if rows else 'Свободных сеансов нет.\nВыберите другую дату.'
-            rows += [[('↻ Обновить время',b('refresh'))],[('← Назад',b('back','date'))],[('☎️ Другое время','contact')]]
+                if available:rows.append([(f'{hour:02}:00 - {(hour+2)%24:02}:00',b('slot',str(hour)))])
+            text='🕒 Выберите удобное время' if rows else 'Свободных сеансов нет.\nВыберите другую дату.'
+            rows += [[('← Назад',b('back','date'))],[('💬 Другое время','contact')]]
             await self.say(m,heading+text,rows+footer,photo='time',edit=edit)
         elif state=='review':
             catalog,holidays=await self.store.pricing()
@@ -225,14 +230,12 @@ class BookingUI:
             await self.store.save(actor,d,'review',data)
             d=await self.store.draft(actor,d['token']);b=lambda action,value='':callback(action,d,value)
             start=datetime.fromisoformat(data['start']);end=start+timedelta(hours=2)
-            text=booking_summary(data)+f'Простыни включены: {data["guests"]} шт.\n\nАренда: {rub(q["rent"])}\n'
-            if q['guest_extra']:text+=f'Доплата за гостей: {rub(q["guest_extra"])}\n'
-            text+=f'Итого: {rub(q["total"])}\n\nОплата на месте · без предоплаты.\nЗаявку подтвердит администратор.'
-            if start-datetime.now(TZ)<timedelta(hours=24):text+='\nДо начала менее суток: после подтверждения отмена только через администратора.'
-            rows=[[(('☑' if data.get('consent') else '☐')+' Принимаю правила',b('consent')),('📖 Правила',b('rules'))]]
-            if data.get('consent'):rows.insert(0,[('✅ Подтвердить бронирование',b('submit'))])
-            rows.append([('✏️ Изменить данные',b('editmenu'))])
-            rows.append([('← Назад',b('back','slot'))])
+            text=(f'📋 Проверьте, все ли верно?\n\n👤 {data["name"]}\n📱 {data["phone"]}\n'
+                  f'👥 Кол-во гостей: {data["guests"]} чел.\nСтарше 7 лет {data["guests"]-data["children"]} чел\n'
+                  f'Младше 7 лет {data["children"]} чел\n📅 Дата: {start:%d.%m.%Y}\n🕒 Время {start:%H:%M}–{end:%H:%M}\n\n'
+                  f'Общая стоимость составит {rub(q["total"])}\n\nНажмите для подтверждения ↓\n\n'
+                  'Подтверждая бронирование, вы соглашаетесь с правилами.')
+            rows=[[('✅ Подтвердить бронирование',b('submit'))],[('← Назад',b('back','slot'))]]
             await self.say(m,text,rows+footer,photo='booking',edit=edit)
 
     async def listing(self,m,actor,history=False,offset=0,edit=False):
@@ -295,10 +298,10 @@ class BookingUI:
                 await self.render(m,actor,d);return
             if '_filled' not in data:data['_filled']=collected_fields(state,data)
             profile=state.startswith('profile_')
-            if state in ('phone_contact','profile_contact') and text in ('← Назад','✕ Отменить оформление'):
+            if state in ('phone_contact','profile_contact') and text in ('← Назад','✕ Отменить оформление','✖ Отменить оформление'):
                 await self.leave_contact(m,actor)
                 d=await self.store.draft(actor,d['token']);data=dict(d['data'])
-                if text=='✕ Отменить оформление':
+                if text in ('✕ Отменить оформление','✖ Отменить оформление'):
                     await self.say(m,'Отменить оформление?\n\nОтправленные бронирования сохранятся.',[[('Да, отменить оформление',callback('discard',d))],[('← Назад','resume')]]+nav());return
                 previous='profile_name' if profile else 'review' if data.pop('editing',False) and data.get('start') else 'name'
                 await self.store.save(actor,d,previous,data)
@@ -389,7 +392,7 @@ class BookingUI:
             if len(parts)!=4:raise RuleError('Это кнопка прежнего экрана. Откройте текущее бронирование.')
             action,token,revision,value=parts
             if action=='submit':
-                ident,created=await self.store.submit(actor,token,expected_revision=int(revision))
+                ident,created=await self.store.submit(actor,token,expected_revision=int(revision),accept_rules=True)
                 await self.say(m,'✅ Заявка отправлена\n\nВремя занято за вами.\nАдминистратор подтвердит или отклонит заявку.\nМы сообщим о решении здесь.' if created else 'Эта заявка уже отправлена.',[[('📋 Открыть бронирование','open:'+ident)]]+nav(),photo='booking',edit=True);return
             d=await self.store.draft(actor,token)
             if d['revision']!=int(revision):

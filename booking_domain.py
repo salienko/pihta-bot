@@ -49,9 +49,10 @@ def card(row, personal=True):
     d,q=row['data'],row['estimate']
     start=row['starts_at'].astimezone(TZ);end=row['ends_at'].astimezone(TZ)
     icons={'pending':'⏳','confirmed':'✅','cancelled':'✕','rejected':'✕','expired':'✕','completed':'✓','draft':'✏️'}
+    min_age=d.get('guest_min_paid_age',7)
     lines=[f"Бронь № {row['id']}",f"{icons[row['status']]} {LABELS[row['status']]}",'',f'📅 {start:%d.%m.%Y} · {start:%H:%M}–{end:%H:%M}',
-           'Время московское','',f"Кол-во гостей: {d['guests']}",f"Гости от 7 лет: {d['guests']-d['children']}",
-           f"Дети до 6 лет включительно: {d['children']}",f"Простыни включены: {d['guests']} шт.",'',f"Аренда: {rub(q['rent'])}"]
+           'Время московское','',f"Кол-во гостей: {d['guests']}",f"Гости от {min_age} лет: {d['guests']-d['children']}",
+           f"Дети до {min_age-1} лет включительно: {d['children']}",f"Простыни включены: {d['guests']} шт.",'',f"Аренда: {rub(q['rent'])}"]
     if q['guest_extra']:lines.append(f"Доплата за гостей: {rub(q['guest_extra'])}")
     # Historical snapshots can contain old goods; display them without enabling orders.
     lines += [f"{i['name']} × {i['quantity']} — {rub(i['total'])}" for i in q['items']]

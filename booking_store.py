@@ -120,7 +120,22 @@ class BookingStore:
             end=validate_start(start,clock)
             return not await self.blocked(db,start,end+timedelta(hours=1))
 
-    async def submit(self,actor,token,clock=None,expected_revision=None):
+    async def available_days(self,days):
+        from booking_domain import SLOTS
+        async with self.tx() as db:
+            clock=await self.clock(db);await self.expire(db,clock)
+            ranges=await db.fetch("SELECT starts_at,blocked_until AS ends_at FROM bookings WHERE status IN ('pending','confirmed','completed') OR (status='expired' AND blocked_until>clock_timestamp()) UNION ALL SELECT starts_at,ends_at FROM calendar_blocks WHERE active")
+            result=set()
+            for day in days:
+                for hour in SLOTS:
+                    start=datetime.combine(day,datetime.min.time(),TZ)+timedelta(hours=hour)
+                    try:end=validate_start(start,clock)+timedelta(hours=1)
+                    except RuleError:continue
+                    if not any(r['starts_at']<end and r['ends_at']>start for r in ranges):
+                        result.add(day);break
+            return result
+
+    async def submit(self,actor,token,clock=None,expected_revision=None,accept_rules=False):
         async with self.tx() as db:
             clock=await self.clock(db,clock);await self.expire(db,clock)
             old=await db.fetchval('SELECT id FROM bookings WHERE telegram_id=$1 AND draft_token=$2',actor,token)
@@ -134,6 +149,9 @@ class BookingStore:
             if data.get('cart'):
                 raise RuleError('Эта версия принимает только аренду. Откройте итог бронирования заново.')
             start=datetime.fromisoformat(data['start']);end=validate_start(start,clock)
+            if accept_rules:
+                data['consent']=True
+                data['guest_min_paid_age']=8
             if not data.get('consent') or data.get('rules_hash')!=self.settings.rules_hash:raise RuleError('Примите актуальные правила.')
             data['name']=clean_name(data['name']);data['phone']=normalize_phone(data['phone'])
             catalog,holidays=await self.pricing(db)
