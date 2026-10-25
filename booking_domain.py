@@ -42,6 +42,14 @@ def estimate(data, catalog, holidays):
         items.append(dict(code=code,name=item['name'],quantity=qty,unit_price=item['price'],total=item['price']*qty))
     return dict(rent=rent,guest_extra=extra,items=items,total=rent+extra+sum(i['total'] for i in items))
 
+def payment_confirmation(row):
+    text='Ваша оплата принята. Спасибо.'
+    amount=row.get('actual_total') if row.get('actual_total') is not None else row['estimate']['total']
+    if 0<row.get('paid',0)<amount and row['status'] in ('pending','confirmed'):
+        text+=' Не забудьте внести оставшуюся сумму до начала сеанса.'
+    return text
+
+
 def can_cancel(status, start, clock):
     return status == 'pending'
 

@@ -10,6 +10,11 @@ CREATE TABLE IF NOT EXISTS bookings(
  no_show boolean NOT NULL DEFAULT false, revision integer NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS bookings_customer ON bookings(telegram_id,starts_at);
+ALTER TABLE bookings ALTER COLUMN telegram_id DROP NOT NULL;
+CREATE TABLE IF NOT EXISTS booking_payment_windows(
+ booking_id text PRIMARY KEY REFERENCES bookings(id),link_received_at timestamptz NOT NULL,
+ warned_at timestamptz,next_check_at timestamptz NOT NULL DEFAULT now()
+);
 CREATE INDEX IF NOT EXISTS bookings_calendar ON bookings(starts_at,blocked_until);
 CREATE TABLE IF NOT EXISTS audit(id bigserial PRIMARY KEY,booking_id text REFERENCES bookings(id),actor bigint NOT NULL,action text NOT NULL,detail jsonb NOT NULL DEFAULT '{}',created_at timestamptz NOT NULL DEFAULT now());
 CREATE TABLE IF NOT EXISTS outbox(id bigserial PRIMARY KEY,booking_id text NOT NULL REFERENCES bookings(id),recipient bigint NOT NULL,event text NOT NULL,text text NOT NULL,due_at timestamptz NOT NULL DEFAULT now(),attempts integer NOT NULL DEFAULT 0,locked_until timestamptz,delivered_at timestamptz,disabled boolean NOT NULL DEFAULT false,last_error text,UNIQUE(booking_id,recipient,event));

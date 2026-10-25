@@ -24,6 +24,8 @@ async def deliver_once(bot,store):
             current=await store.pool.fetchval('SELECT status FROM bookings WHERE id=$1',row['booking_id'])
             expected='pending' if ':pending:' in row['event'] else 'confirmed'
             if current!=expected:await store.delivered(row['id']);return True
+            if not await store.reserve_delivery_allowed(row['booking_id'],row['event'],row['recipient']):
+                await store.delivered(row['id']);return True
         buttons=[[('Открыть веб-панель','staffweb')]] if row['recipient'] in store.settings.admin_ids else [[('Открыть бронь','open:'+row['booking_id'])]]
         payment=await store.payment_delivery(row['event'])
         if row['event'].startswith(('payreq:','paylink:','payreported:')) and not payment:
@@ -40,6 +42,7 @@ async def deliver_once(bot,store):
             url=await store.receipt_delivery_url(row['event'])
             if url:buttons=[[('Открыть чек',url)]]+buttons
         sent=await bot.send_message(row['recipient'],row['text'],reply_markup=kb(buttons))
+        await store.payment_message_sent(row['event'],row['booking_id'],row['recipient'])
         if payment and not row['event'].startswith('paylink:') and row['recipient'] in store.settings.admin_ids:
             await store.payment_message_delivered(payment['id'],row['recipient'],sent.message_id)
     except TelegramRetryAfter as e:await store.failed(row['id'],'rate_limit',e.retry_after)
@@ -66,6 +69,7 @@ async def provider_worker(store):
     while True:
         try:
             await store.invoice_once()
+            await store.reserve_once()
             await store.settlement_once()
             for _ in range(4):
                 if not await store.poll_once():break

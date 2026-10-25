@@ -70,3 +70,10 @@ The staff page displays the immutable request ID. Look up the invoice in PayKeep
 Run `python -m unittest discover -v` with `TEST_DATABASE_URL` pointing to a disposable PostgreSQL instance, never production. Tests create and remove only uniquely named test schemas. Successful unit/DB tests do not prove delivery from PayKeeper through the production HTTPS proxy, fiscal legality, or actual guest delivery; these are separate activation checks.
 
 Official references: [invoices](https://docs.paykeeper.ru/dokumentatsiya-json-api/scheta/), [POST notifications](https://docs.paykeeper.ru/metody-integratsii/priyom-post-opoveshhenij/), [receipts](https://docs.paykeeper.ru/dokumentatsiya-json-api/rabota-s-chekami-54-fz/), [receipt cart](https://docs.paykeeper.ru/onlain-kassa-54-fz/tovary-v-cheke-54-fz-full/).
+
+
+## Booking reserve and telephone bookings (2026-10-25)
+
+A pending Telegram booking with no received payment gets one reminder after 15 minutes if no payment link has been delivered. The first successfully delivered invoice link starts a separate window: after 10 minutes send one warning, then allow another 10 minutes from successful warning delivery. Before cancellation reconcile every invoice with the provider. Errors, uncertain invoice creation and concurrent invoice changes hold the booking for review. Any positive recorded payment prevents reserve cancellation. Late payments are recorded for review and never reopen a cancelled slot. Existing delivered links do not receive retrospective deadlines.
+
+Staff can select a date and free standard session, enter phone and guest count, preview the existing tariff calculation and create a booking atomically. Name is optional; children use existing pricing rules. Telephone bookings have no Telegram owner: staff copy payment links manually, and Telegram delivery deadlines do not apply. Do not infer Telegram identity from a matching phone. A shared registry of verified communication channels and multiple bots is explicitly deferred.

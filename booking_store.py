@@ -12,6 +12,8 @@ from booking_flow import VERSION,require
 from booking_payments import PaymentStore,DEPOSIT,total as payment_total
 from paykeeper_store import PayKeeperStore
 from final_receipts import FinalReceiptStore
+from booking_reserve import ReserveStore
+from staff_booking import StaffBookingStore
 
 SCHEMA='pihta_booking_v2'
 LOCK=7319845
@@ -23,7 +25,7 @@ def unpack(row):
         if key in d and isinstance(d[key],str):d[key]=json.loads(d[key])
     return d
 
-class BookingStore(FinalReceiptStore,PayKeeperStore,PaymentStore):
+class BookingStore(ReserveStore,StaffBookingStore,FinalReceiptStore,PayKeeperStore,PaymentStore):
     def __init__(self,settings,pool):self.settings,self.pool=settings,pool
 
     @classmethod
@@ -54,12 +56,13 @@ class BookingStore(FinalReceiptStore,PayKeeperStore,PaymentStore):
         await db.execute('INSERT INTO audit(booking_id,actor,action,detail) VALUES($1,$2,$3,$4::jsonb)',ident,actor,action,json.dumps(detail or {},ensure_ascii=False))
     async def enqueue(self,db,row,event,text,recipients=None):
         for who in set(recipients if recipients is not None else [row['telegram_id'],*self.settings.admin_ids]):
+            if who is None:continue
             await db.execute('INSERT INTO outbox(booking_id,recipient,event,text) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING',row['id'],who,event,text)
 
     async def expire(self,db,clock):
         rows=await db.fetch("SELECT * FROM bookings WHERE status IN ('pending','confirmed') AND ends_at<=$1 FOR UPDATE",clock)
         for raw in rows:
-            row=unpack(raw);status='expired' if row['status']=='pending' else 'completed'
+            row=unpack(raw);status='expired' if row['status']=='pending' and not row['paid'] else 'completed'
             reason='Сеанс закончился без подтверждения.' if status=='expired' else ''
             await db.execute('UPDATE bookings SET status=$1,reason=$2,revision=revision+1 WHERE id=$3',status,reason,row['id'])
             await db.execute("UPDATE outbox SET disabled=true WHERE booking_id=$1 AND event LIKE 'reminder:%' AND delivered_at IS NULL",row['id'])
@@ -265,6 +268,7 @@ class BookingStore(FinalReceiptStore,PayKeeperStore,PaymentStore):
             for raw in rows:
                 row=unpack(raw);start=row['starts_at'];age=(clock-row['created_at']).total_seconds()
                 if row['status']=='pending':
+                    await self.reserve_reminders(db,row,clock)
                     if age>=900:
                         n=int((age-900)//3600)
                         await self.enqueue(db,row,f'reminder:pending:{n}',f"Заявка № {row['id']} ждёт подтверждения.\n"+card(row),self.settings.admin_ids)

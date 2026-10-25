@@ -379,12 +379,16 @@ class BookingUI:
             if action=='payrequest':
                 req,created=await self.store.request_payment(actor,parts[2],parts[1])
                 await self.show(m,actor,parts[2],edit=True)
-                await m.answer(('Готовим ссылку PayKeeper. Она придёт отдельным сообщением.' if created else 'Запрос уже сохранён. Используйте действующую ссылку или дождитесь её получения.') if self.settings.paykeeper_enabled else ('Запрос ссылки передан администратору.' if created else 'Запрос уже передан администратору. Ожидайте ссылку.'));return
+                await m.answer(('Готовим ссылку на оплату. Она придёт отдельным сообщением.' if created else 'Запрос уже сохранён. Используйте действующую ссылку или дождитесь её получения.') if self.settings.paykeeper_enabled else ('Запрос ссылки передан администратору.' if created else 'Запрос уже передан администратору. Ожидайте ссылку.'));return
             if action=='paycheck':
                 status=await self.store.check_paykeeper(actor,parts[1])
                 ident=await self.store.pool.fetchval('SELECT booking_id FROM paykeeper_invoices WHERE request_id=$1',parts[1])
                 await self.show(m,actor,ident,edit=True)
-                await m.answer({'paid':'Оплата уже учтена. Карточка брони обновлена.','expired':'Срок счёта истёк. Получите новую ссылку; бронь сохранена.'}.get(status,'PayKeeper пока не подтвердил оплату. Повторите проверку позже.'));return
+                from booking_domain import payment_confirmation
+                current=await self.store.get(actor,ident)
+                message=payment_confirmation(current) if status=='paid' else 'Срок счёта истёк. Получите новую ссылку; бронь сохранена.' if status=='expired' else 'Мы не видим вашей оплаты. Повторите позже.'
+                if status=='paid' and not current['paid']:message='Ваша оплата принята. Спасибо. Администратор проверит её привязку к брони. Повторно оплачивать не нужно.'
+                await m.answer(message);return
             if action=='payhistory':
                 payments=await self.store.payment_history(actor,parts[1]);rows=[];text='Платежи и чеки'
                 for p in payments:

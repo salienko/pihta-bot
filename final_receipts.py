@@ -9,7 +9,7 @@ class FinalReceiptStore:
     async def request_final_receipt(self, actor, ident):
         self.admin(actor)
         if not self.settings.paykeeper_settlement_enabled:raise RuleError('Итоговые чеки временно отключены.')
-        if not self.settings.paykeeper_enabled:raise RuleError('PayKeeper пока не включён.')
+        if not self.settings.paykeeper_enabled:raise RuleError('Приём оплаты пока не включён.')
         from booking_store import unpack
         async with self.tx() as db:
             old=await db.fetchrow('SELECT * FROM paykeeper_settlements WHERE booking_id=$1',ident)
@@ -20,7 +20,7 @@ class FinalReceiptStore:
             payments=await db.fetch('SELECT p.*,i.payment_type FROM paykeeper_payments p JOIN paykeeper_invoices i USING(request_id) WHERE i.booking_id=$1',ident)
             amount=total(row)
             if not payments or row['paid']!=amount or sum(p['amount'] for p in payments)!=amount or any(p['disposition']!='applied' or p['payment_type'] not in ('prepay','part_prepay') for p in payments):
-                raise RuleError('Нужна полная оплата подтверждёнными предоплатами PayKeeper. Ручные платежи, переплаты и спорные операции требуют сверки.')
+                raise RuleError('Нужна полная оплата подтверждёнными предоплатами через платёжный сервис. Ручные платежи, переплаты и спорные операции требуют сверки.')
             if await db.fetchval("SELECT 1 FROM audit WHERE booking_id=$1 AND action='refund' LIMIT 1",ident):
                 raise RuleError('По брони был возврат: требуется отдельная сверка.')
             ids=[p['payment_id'] for p in payments]
@@ -39,7 +39,7 @@ class FinalReceiptStore:
             for old in stale:
                 from booking_store import unpack
                 row=unpack(await db.fetchrow('SELECT * FROM bookings WHERE id=$1',old['booking_id']))
-                await self.enqueue(db,row,'pkfinalerror:'+old['booking_id'],'⚠️ Отправка итогового чека была прервана. Требуется сверка с PayKeeper, повторная выдача остановлена.',self.settings.admin_ids)
+                await self.enqueue(db,row,'pkfinalerror:'+old['booking_id'],'⚠️ Отправка итогового чека была прервана. Требуется сверка с платёжным сервисом, повторная выдача остановлена.',self.settings.admin_ids)
             r=await db.fetchrow("SELECT * FROM paykeeper_settlements WHERE state IN ('queued','pending') AND next_check_at<=now() ORDER BY next_check_at LIMIT 1 FOR UPDATE")
             if not r:return False
             await db.execute("UPDATE paykeeper_settlements SET state=CASE WHEN state='queued' THEN 'sending' ELSE state END,next_check_at=now()+interval '2 minutes' WHERE booking_id=$1",r['booking_id'])
@@ -64,7 +64,7 @@ class FinalReceiptStore:
                 await db.execute("UPDATE paykeeper_settlements SET state=CASE WHEN receipt_id IS NULL THEN 'uncertain' ELSE state END,last_error='provider_check_required' WHERE booking_id=$1",r['booking_id'])
                 from booking_store import unpack
                 row=unpack(await db.fetchrow('SELECT * FROM bookings WHERE id=$1',r['booking_id']))
-                await self.enqueue(db,row,'pkfinalerror:'+r['booking_id'],'⚠️ Итоговый чек требует сверки с PayKeeper. Не создавайте повторный чек с новым ключом.',self.settings.admin_ids)
+                await self.enqueue(db,row,'pkfinalerror:'+r['booking_id'],'⚠️ Итоговый чек требует сверки с платёжным сервисом. Не создавайте повторный чек с новым ключом.',self.settings.admin_ids)
         return True
 
     async def reconcile_settlement(self,actor,ident,receipt_id):

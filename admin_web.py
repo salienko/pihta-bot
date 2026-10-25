@@ -18,7 +18,7 @@ def money(value):
         return int(amount)
     except (InvalidOperation,ValueError,TypeError):raise RuleError('Введите сумму в рублях, не более двух знаков после точки.')
 
-ACTION_NAMES={'paykeeper_invoice_requested':'Запрошен счёт PayKeeper','staff_invoice_requested':'Сотрудник запросил счёт','paykeeper_payment':'Получен платёж PayKeeper','settlement_requested':'Подтверждено оказание услуги, запрошен итоговый чек','settlement_success':'Итоговый чек сформирован','settlement_failed':'Ошибка итогового чека','settlement_reconciled':'Итоговый чек привязан после сверки'}
+ACTION_NAMES={'staff_submitted':'Создана телефонная бронь','reserve_cancelled':'Бронь отменена по сроку оплаты','paykeeper_invoice_requested':'Запрошен счёт на оплату','staff_invoice_requested':'Сотрудник запросил счёт','paykeeper_payment':'Получен платёж','settlement_requested':'Подтверждено оказание услуги, запрошен итоговый чек','settlement_success':'Итоговый чек сформирован','settlement_failed':'Ошибка итогового чека','settlement_reconciled':'Итоговый чек привязан после сверки'}
 
 def make_app(store,settings,secure=True):
     @web.middleware
@@ -41,7 +41,7 @@ def make_app(store,settings,secure=True):
         return s
     def form(s,action,fields,label='Сохранить',danger=False):
         return f'<form method="post" action="{e(action)}"><input type="hidden" name="csrf" value="{e(s["csrf"])}"><input type="hidden" name="operation" value="{secrets.token_hex(16)}">'+fields+f'<button class="{"danger" if danger else ""}">{e(label)}</button></form>'
-    def navigation(s):return '<nav><a href="/">Заявки и календарь</a><a href="/catalog">Тарифы и праздники</a><a href="/archive">Прежние заявки</a><a href="/audit">Журнал действий</a>'+('<a href="/payments">Счета и чеки</a>' if settings.paykeeper_enabled else '')+'</nav>'+form(s,'/logout','','Выйти')
+    def navigation(s):return '<nav><a href="/">Заявки и календарь</a><a href="/new-booking">Создать бронь</a><a href="/catalog">Тарифы и праздники</a><a href="/archive">Прежние заявки</a><a href="/audit">Журнал действий</a>'+('<a href="/payments">Счета и чеки</a>' if settings.paykeeper_enabled else '')+'</nav>'+form(s,'/logout','','Выйти')
 
     async def login_page(request):
         body='<div class="card"><h1>Вход администратора</h1><p>Получите личную одноразовую ссылку командой /admin в боте «Пихта».</p><form id="login" action="/login" method="post"><input type="hidden" id="token" name="token"><button id="enter" hidden>Войти</button></form><script src="/login.js" defer></script></div>'
@@ -83,6 +83,7 @@ def make_app(store,settings,secure=True):
     async def detail(request):
         s=await auth(request);r=await store.get(s['actor'],request.match_info['id'],staff=True)
         body=navigation(s)+'<h1>Бронь № '+e(r['id'])+'</h1><div class="card"><pre>'+e(card(r))+'</pre></div>'
+        if r['telegram_id'] is None:body+='<div class="notice">Бронь создана по телефону. Ссылку на оплату скопируйте и передайте гостю. Автоматические сообщения Telegram и отмена по таймеру доставки ссылки для этой брони не применяются.</div>'
         if r['status']=='pending':body+='<div class="notice">Бронь подтвердится автоматически после фиксации поступления минимум 2 000 ₽ или всей стоимости. Ссылка и сообщение гостя «Уже оплатил» не являются подтверждением поступления.</div>'
         if r['status'] in ('pending','confirmed'):
             body+='<div class="card">'+form(s,'/booking/'+r['id']+'/cancel','<label>Причина отмены<textarea name="reason" minlength="2" maxlength="500" required></textarea></label>','Отменить с уведомлением',True)+'</div>'
@@ -91,14 +92,14 @@ def make_app(store,settings,secure=True):
         for action,title in [('payment','Подтвердить поступление денег'),('refund','Фактически возвращено вручную')]:
             body+='<div class="card"><h2>'+title+'</h2>'+form(s,'/booking/'+r['id']+'/'+action,'<label>Сумма, ₽<input name="amount" type="number" min="0.01" max="1000000" step="0.01" required></label><label>Комментарий<input name="note" minlength="2" maxlength="500" required></label>','Зафиксировать факт')+'</div>'
         body+='</div><div class="card"><h2>Фактическое посещение — отдельно от брони</h2><p>Исходная сумма и состав сохраняются. Меньшее число гостей не снижает стоимость.</p>'+form(s,'/booking/'+r['id']+'/actual','<label>Фактических гостей<input name="guests" type="number" min="1" max="8" required></label><label>Итог фактического расчёта, ₽<input name="total" type="number" min="0" step="0.01" required></label><label>Обоснование расчёта<textarea name="note" minlength="2" maxlength="500" required></textarea></label>')+'</div>'
-        body+='<div class="card"><h2>Связаться с гостем</h2><p>Уточните детали посещения. Сообщение не меняет бронь и занятость.</p>'+form(s,'/booking/'+r['id']+'/message','<label>Сообщение<textarea name="text" minlength="2" maxlength="1000" required></textarea></label>','Отправить гостю')+'</div>'
+        if r['telegram_id'] is not None:body+='<div class="card"><h2>Связаться с гостем</h2><p>Уточните детали посещения. Сообщение не меняет бронь и занятость.</p>'+form(s,'/booking/'+r['id']+'/message','<label>Сообщение<textarea name="text" minlength="2" maxlength="1000" required></textarea></label>','Отправить гостю')+'</div>'
         if r['status'] in ('confirmed','completed'):body+='<div class="card">'+form(s,'/booking/'+r['id']+'/no_show','<label>Комментарий<input name="note" minlength="2" maxlength="500" required></label>','Отметить неявку')+'</div>'
         events=await store.pool.fetch('SELECT * FROM audit WHERE booking_id=$1 ORDER BY id DESC LIMIT 100',r['id'])
         body+='<div class="card"><h2>История действий</h2>'
         for event in events:body+='<p>'+e(str(event['created_at'].astimezone(TZ)))+' · '+e(ACTION_NAMES.get(event['action'],event['action']))+' · сотрудник '+e(event['actor'])+'</p>'
         body+='</div>'
         if settings.paykeeper_enabled:
-            body+='<div class="card"><h2>Платежи и чеки PayKeeper</h2><a href="/payments?booking='+e(r['id'])+'">Выставить счёт по этой брони</a>'
+            body+='<div class="card"><h2>Платежи и чеки</h2><a href="/payments?booking='+e(r['id'])+'">Выставить счёт по этой брони</a>'
             for p in await store.payment_history(s['actor'],r['id'],staff=True):
                 body+='<p>'+e(rub(p['amount']))+' · '+e({'applied':'Учтён','review':'Требует сверки','standalone':'Отдельный платёж'}[p['disposition']])
                 if p['receipt_url']:body+=' · <a href="'+e(p['receipt_url'])+'" target="_blank" rel="noreferrer">Открыть чек</a>'
@@ -113,7 +114,7 @@ def make_app(store,settings,secure=True):
                     body+='<p>'+e(labels[final['state']])+' · '+e(rub(final['amount']))+'</p>'
                     if final['url']:body+='<a href="'+e(final['url'])+'" target="_blank" rel="noreferrer">Открыть итоговый чек</a>'
                     if final['state']=='uncertain':
-                        body+='<p>Ключ для сверки в PayKeeper: '+e(final['receipt_key'])+'</p>'+form(s,'/booking/'+r['id']+'/settlement_reconcile','<label>Номер уже созданного чека PayKeeper<input name="receipt_id" pattern="[0-9]{1,40}" required></label>','Проверить и привязать чек')
+                        body+='<p>Ключ для сверки: '+e(final['receipt_key'])+'</p>'+form(s,'/booking/'+r['id']+'/settlement_reconcile','<label>Номер уже созданного чека<input name="receipt_id" pattern="[0-9]{1,40}" required></label>','Проверить и привязать чек')
                 else:
                     from booking_payments import total
                     body+='<p>Стоимость услуги: '+e(rub(total(r)))+'. Ранее внесено: '+e(rub(r['paid']))+'. Новый платёж не создаётся. Действие отправит запрос в кассу.</p>'+form(s,'/booking/'+r['id']+'/settlement','<label><input type="checkbox" name="service_done" value="yes" required>Подтверждаю: услуга фактически оказана, сумма и платежи проверены.</label>','Услуга оказана — оформить итоговый чек')
@@ -214,7 +215,7 @@ def make_app(store,settings,secure=True):
             if i['booking_id']:body+='<a href="/booking/'+e(i['booking_id'])+'">Открыть бронь</a>'
             if i['url']:
                 body+='<p><a href="'+e(i['url'])+'" target="_blank" rel="noreferrer">Открыть счёт</a></p><label>Ссылка<input readonly value="'+e(i['url'])+'"></label><button type="button" data-copy="'+e(i['url'])+'">Скопировать ссылку</button><span role="status"></span>'
-            if i['state']=='uncertain':body+='<p>Проверьте в PayKeeper счёт с этим номером запроса. Повторное создание заблокировано.</p>'+form(s,'/payments/'+i['request_id']+'/resolve','<label>Номер найденного счёта PayKeeper<input name="invoice_id" maxlength="40" required></label>','Проверить и привязать счёт')
+            if i['state']=='uncertain':body+='<p>Проверьте в платёжном сервисе счёт с этим номером запроса. Повторное создание заблокировано.</p>'+form(s,'/payments/'+i['request_id']+'/resolve','<label>Номер найденного счёта<input name="invoice_id" maxlength="40" required></label>','Проверить и привязать счёт')
             for r in await store.pool.fetch('SELECT r.* FROM paykeeper_fiscal_receipts r JOIN paykeeper_payments p USING(payment_id) WHERE p.request_id=$1',i['request_id']):
                 body+='<p><a href="'+e(r['url'])+'" target="_blank" rel="noreferrer">Открыть чек</a></p>'
             body+='</div>'
@@ -237,6 +238,8 @@ def make_app(store,settings,secure=True):
     async def style(request):return web.Response(text=STYLE,content_type='text/css')
     from paykeeper import mount
     mount(app,store,settings)
+    from admin_booking import mount_staff_booking
+    mount_staff_booking(app,store,auth,form,page,e,navigation)
     app.add_routes([web.get('/payments',payments),web.post('/payments',payment_create),web.post('/payments/{id}/resolve',payment_resolve),web.get('/payments.js',payment_js)])
     app.add_routes([web.get('/style.css',style),web.get('/health',health),web.get('/login',login_page),web.get('/login.js',login_js),web.post('/login',login),web.post('/logout',logout),web.get('/',home),web.get('/booking/{id}',detail),web.post('/booking/{id}/{action}',action),web.post('/block',block),web.post('/unblock/{id}',unblock),web.get('/archive',archive),web.get('/audit',audit),web.get('/catalog',catalog),web.post('/holiday',holiday),web.post('/holiday/remove',remove_holiday)])
     return app

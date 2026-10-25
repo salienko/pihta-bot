@@ -248,7 +248,8 @@ class Payments(unittest.IsolatedAsyncioTestCase):
         await self.linked();await self.accept()
         self.provider.receipts.return_value=[dict(id='55',url='https://paykeeper.example/receipt/ABCDEFGH/?rc_id=55')]
         await self.store.receipt_once()
-        self.assertEqual(await self.store.pool.fetchval("SELECT text FROM outbox WHERE event='pkpaid:123'"),ACCEPTED_READY)
+        from booking_domain import payment_confirmation
+        self.assertEqual(await self.store.pool.fetchval("SELECT text FROM outbox WHERE event='pkpaid:123'"),payment_confirmation(await self.store.get(2,self.ident))+' '+ACCEPTED_READY)
         self.assertEqual(await self.store.pool.fetchval("SELECT count(*) FROM outbox WHERE event='pkreceipt:55'"),0)
         history=await self.store.payment_history(2,self.ident)
         self.assertIn('ABCDEFGH',history[0]['receipt_url'])
