@@ -28,6 +28,41 @@ CREATE TABLE IF NOT EXISTS payment_requests(
 );
 CREATE INDEX IF NOT EXISTS payment_requests_booking ON payment_requests(booking_id,created_at);
 CREATE TABLE IF NOT EXISTS payment_messages(chat_id bigint NOT NULL,message_id bigint NOT NULL,request_id text NOT NULL REFERENCES payment_requests(id),PRIMARY KEY(chat_id,message_id));
+CREATE TABLE IF NOT EXISTS paykeeper_invoices(
+ request_id text PRIMARY KEY,booking_id text REFERENCES bookings(id),actor bigint NOT NULL,
+ amount bigint NOT NULL CHECK(amount>0),paid_before bigint NOT NULL CHECK(paid_before>=0),
+ client_id text NOT NULL,phone text NOT NULL,email text NOT NULL DEFAULT '',payment_type text NOT NULL,
+ invoice_id text UNIQUE,url text NOT NULL DEFAULT '',state text NOT NULL DEFAULT 'queued'
+ CHECK(state IN ('queued','creating','uncertain','ready','received','expired')),
+ created_at timestamptz NOT NULL DEFAULT now(),started_at timestamptz,
+ next_check_at timestamptz NOT NULL DEFAULT now(),last_error text NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS paykeeper_due ON paykeeper_invoices(next_check_at) WHERE state='ready';
+CREATE TABLE IF NOT EXISTS paykeeper_payments(
+ payment_id text PRIMARY KEY,request_id text NOT NULL REFERENCES paykeeper_invoices(request_id),
+ client_id text NOT NULL,amount bigint NOT NULL CHECK(amount>0),
+ disposition text NOT NULL CHECK(disposition IN ('applied','review','standalone')),
+ created_at timestamptz NOT NULL DEFAULT now(),next_receipt_at timestamptz NOT NULL DEFAULT now(),
+ receipt_attempts integer NOT NULL DEFAULT 0,receipt_done boolean NOT NULL DEFAULT false
+);
+CREATE TABLE IF NOT EXISTS paykeeper_fiscal_receipts(
+ id text PRIMARY KEY,payment_id text NOT NULL REFERENCES paykeeper_payments(payment_id),
+ url text NOT NULL,created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS paykeeper_unmatched(
+ payment_id text PRIMARY KEY,order_id text NOT NULL,client_id text NOT NULL,
+ amount bigint NOT NULL CHECK(amount>0),created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS paykeeper_settlements(
+ booking_id text PRIMARY KEY REFERENCES bookings(id),actor bigint NOT NULL,
+ amount bigint NOT NULL CHECK(amount>0),phone text NOT NULL,tax text NOT NULL,
+ receipt_key text NOT NULL UNIQUE,payment_ids jsonb NOT NULL,
+ state text NOT NULL DEFAULT 'queued' CHECK(state IN ('queued','sending','uncertain','pending','success','failed')),
+ receipt_id text UNIQUE,url text NOT NULL DEFAULT '',last_error text NOT NULL DEFAULT '',
+ created_at timestamptz NOT NULL DEFAULT now(),next_check_at timestamptz NOT NULL DEFAULT now()
+);
+ALTER TABLE outbox ALTER COLUMN booking_id DROP NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS standalone_outbox_event ON outbox(recipient,event) WHERE booking_id IS NULL;
 CREATE OR REPLACE FUNCTION protect_snapshot() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
  IF ROW(NEW.id,NEW.telegram_id,NEW.draft_token,NEW.starts_at,NEW.ends_at,NEW.blocked_until,NEW.data,NEW.estimate,NEW.rules_hash,NEW.created_at) IS DISTINCT FROM ROW(OLD.id,OLD.telegram_id,OLD.draft_token,OLD.starts_at,OLD.ends_at,OLD.blocked_until,OLD.data,OLD.estimate,OLD.rules_hash,OLD.created_at) THEN RAISE EXCEPTION 'booking snapshot is immutable'; END IF;

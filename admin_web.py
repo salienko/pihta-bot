@@ -18,6 +18,8 @@ def money(value):
         return int(amount)
     except (InvalidOperation,ValueError,TypeError):raise RuleError('Введите сумму в рублях, не более двух знаков после точки.')
 
+ACTION_NAMES={'paykeeper_invoice_requested':'Запрошен счёт PayKeeper','staff_invoice_requested':'Сотрудник запросил счёт','paykeeper_payment':'Получен платёж PayKeeper','settlement_requested':'Подтверждено оказание услуги, запрошен итоговый чек','settlement_success':'Итоговый чек сформирован','settlement_failed':'Ошибка итогового чека','settlement_reconciled':'Итоговый чек привязан после сверки'}
+
 def make_app(store,settings,secure=True):
     @web.middleware
     async def security(request,handler):
@@ -39,7 +41,7 @@ def make_app(store,settings,secure=True):
         return s
     def form(s,action,fields,label='Сохранить',danger=False):
         return f'<form method="post" action="{e(action)}"><input type="hidden" name="csrf" value="{e(s["csrf"])}"><input type="hidden" name="operation" value="{secrets.token_hex(16)}">'+fields+f'<button class="{"danger" if danger else ""}">{e(label)}</button></form>'
-    def navigation(s):return '<nav><a href="/">Заявки и календарь</a><a href="/catalog">Тарифы и праздники</a><a href="/archive">Прежние заявки</a><a href="/audit">Журнал действий</a></nav>'+form(s,'/logout','','Выйти')
+    def navigation(s):return '<nav><a href="/">Заявки и календарь</a><a href="/catalog">Тарифы и праздники</a><a href="/archive">Прежние заявки</a><a href="/audit">Журнал действий</a>'+('<a href="/payments">Счета и чеки</a>' if settings.paykeeper_enabled else '')+'</nav>'+form(s,'/logout','','Выйти')
 
     async def login_page(request):
         body='<div class="card"><h1>Вход администратора</h1><p>Получите личную одноразовую ссылку командой /admin в боте «Пихта».</p><form id="login" action="/login" method="post"><input type="hidden" id="token" name="token"><button id="enter" hidden>Войти</button></form><script src="/login.js" defer></script></div>'
@@ -93,12 +95,38 @@ def make_app(store,settings,secure=True):
         if r['status'] in ('confirmed','completed'):body+='<div class="card">'+form(s,'/booking/'+r['id']+'/no_show','<label>Комментарий<input name="note" minlength="2" maxlength="500" required></label>','Отметить неявку')+'</div>'
         events=await store.pool.fetch('SELECT * FROM audit WHERE booking_id=$1 ORDER BY id DESC LIMIT 100',r['id'])
         body+='<div class="card"><h2>История действий</h2>'
-        for event in events:body+='<p>'+e(str(event['created_at'].astimezone(TZ)))+' · '+e(event['action'])+' · сотрудник '+e(event['actor'])+'</p>'
-        return web.Response(text=page('Бронь',body+'</div>'),content_type='text/html')
+        for event in events:body+='<p>'+e(str(event['created_at'].astimezone(TZ)))+' · '+e(ACTION_NAMES.get(event['action'],event['action']))+' · сотрудник '+e(event['actor'])+'</p>'
+        body+='</div>'
+        if settings.paykeeper_enabled:
+            body+='<div class="card"><h2>Платежи и чеки PayKeeper</h2><a href="/payments?booking='+e(r['id'])+'">Выставить счёт по этой брони</a>'
+            for p in await store.payment_history(s['actor'],r['id'],staff=True):
+                body+='<p>'+e(rub(p['amount']))+' · '+e({'applied':'Учтён','review':'Требует сверки','standalone':'Отдельный платёж'}[p['disposition']])
+                if p['receipt_url']:body+=' · <a href="'+e(p['receipt_url'])+'" target="_blank" rel="noreferrer">Открыть чек</a>'
+                else:body+=' · Чек формируется'
+                body+='</p>'
+            body+='</div>'
+            if settings.paykeeper_settlement_enabled:
+                final=await store.pool.fetchrow('SELECT * FROM paykeeper_settlements WHERE booking_id=$1',r['id'])
+                body+='<div class="card"><h2>Итоговый чек на оказанную услугу</h2>'
+                if final:
+                    labels={'queued':'Ожидает отправки','sending':'Отправляется','pending':'Касса формирует чек','uncertain':'Нужна сверка — не выдавайте повторно','success':'Выдан','failed':'Ошибка кассы — нужна проверка'}
+                    body+='<p>'+e(labels[final['state']])+' · '+e(rub(final['amount']))+'</p>'
+                    if final['url']:body+='<a href="'+e(final['url'])+'" target="_blank" rel="noreferrer">Открыть итоговый чек</a>'
+                    if final['state']=='uncertain':
+                        body+='<p>Ключ для сверки в PayKeeper: '+e(final['receipt_key'])+'</p>'+form(s,'/booking/'+r['id']+'/settlement_reconcile','<label>Номер уже созданного чека PayKeeper<input name="receipt_id" pattern="[0-9]{1,40}" required></label>','Проверить и привязать чек')
+                else:
+                    from booking_payments import total
+                    body+='<p>Стоимость услуги: '+e(rub(total(r)))+'. Ранее внесено: '+e(rub(r['paid']))+'. Новый платёж не создаётся. Действие отправит запрос в кассу.</p>'+form(s,'/booking/'+r['id']+'/settlement','<label><input type="checkbox" name="service_done" value="yes" required>Подтверждаю: услуга фактически оказана, сумма и платежи проверены.</label>','Услуга оказана — оформить итоговый чек')
+                body+='</div>'
+        return web.Response(text=page('Бронь',body),content_type='text/html')
 
     async def action(request):
         s=await auth(request,True);data=await request.post();ident=request.match_info['id'];kind=request.match_info['action']
-        if kind in ('confirm','reject','cancel'):await store.transition(s['actor'],ident,kind,str(data.get('reason','')),staff=True)
+        if kind=='settlement':
+            if data.get('service_done')!='yes':raise RuleError('Подтвердите фактическое оказание услуги.')
+            await store.request_final_receipt(s['actor'],ident)
+        elif kind=='settlement_reconcile':await store.reconcile_settlement(s['actor'],ident,str(data.get('receipt_id','')))
+        elif kind in ('confirm','reject','cancel'):await store.transition(s['actor'],ident,kind,str(data.get('reason','')),staff=True)
         elif kind=='message':
             key=str(data.get('operation',''))
             if not re_full_token(key):raise RuleError('Обновите форму.')
@@ -134,7 +162,7 @@ def make_app(store,settings,secure=True):
         return web.Response(text=page('Архив',body),content_type='text/html')
     async def audit(request):
         s=await auth(request);rows=await store.pool.fetch('SELECT * FROM audit ORDER BY id DESC LIMIT 100');body=navigation(s)+'<h1>Журнал действий</h1>'
-        for r in rows:body+='<div class="card">'+e(str(r['created_at'].astimezone(TZ)))+' · '+e(r['action'])+' · '+e(r['actor'])+'<pre>'+e(r['detail'])+'</pre></div>'
+        for r in rows:body+='<div class="card">'+e(str(r['created_at'].astimezone(TZ)))+' · '+e(ACTION_NAMES.get(r['action'],r['action']))+' · '+e(r['actor'])+'<pre>'+e(r['detail'])+'</pre></div>'
         return web.Response(text=page('Журнал',body),content_type='text/html')
     async def health(request):
         try:await store.pool.fetchval('SELECT 1')
@@ -162,7 +190,54 @@ def make_app(store,settings,secure=True):
             await store.audit(db,None,s['actor'],'holiday_removed',dict(day=day.isoformat()))
         raise web.HTTPFound('/catalog')
 
+    async def payments(request):
+        s=await auth(request);store.admin(s['actor'])
+        if not settings.paykeeper_enabled:raise web.HTTPNotFound()
+        booking=request.query.get('booking','');phone='';name='';amount=''
+        if booking:
+            from booking_payments import total
+            selected=await store.get(s['actor'],booking,staff=True)
+            phone=selected['data']['phone'];name=selected['data']['name']
+            due=max(0,total(selected)-selected['paid']);amount=f'{due//100}.{due%100:02}' if due else ''
+        fields=(('<label>Имя гостя<input readonly value="'+e(name)+'"></label>' if booking else '')+
+                '<label>Телефон клиента<input name="phone" type="tel" maxlength="32" value="'+e(phone)+'" '+('readonly ' if booking else '')+'required></label>'
+                '<label>Сумма, ₽<input name="amount" type="number" min="0.01" max="1000000" step="0.01" value="'+e(amount)+'" required></label>'
+                '<label>E-mail для чека (по желанию)<input name="email" type="email" maxlength="254"></label>'
+                '<label>Номер брони (необязательно)<input name="booking" maxlength="32" value="'+e(booking)+'" '+('readonly' if booking else '')+'></label>'
+                '<label>Способ расчёта<select name="payment_type" required><option value="">Выберите согласованный способ</option>'
+                '<option value="part_prepay">Частичная предоплата</option><option value="prepay">Предоплата 100%</option>'
+                '<option value="advance">Аванс</option><option value="full">Полный расчёт</option></select></label>')
+        body=navigation(s)+'<h1>Счета и чеки</h1><div class="card"><h2>Выставить счёт</h2><p>Позиция: Оплата аренды бани «Пихта».</p>'+form(s,'/payments',fields,'Создать счёт')+'</div><a href="/payments">Обновить статусы</a>'
+        labels={'queued':'Готовится','creating':'Готовится','uncertain':'Нужна сверка','ready':'Ожидает оплаты','received':'Оплата получена','expired':'Счёт закрыт'}
+        for i in await store.pool.fetch('SELECT * FROM paykeeper_invoices ORDER BY created_at DESC LIMIT 50'):
+            body+='<div class="card"><strong>'+e(rub(i['amount']))+'</strong> · '+e(labels[i['state']])+'<p>Телефон: '+e(i['phone'])+'</p><p>Запрос: '+e(i['request_id'])+'</p>'
+            if i['booking_id']:body+='<a href="/booking/'+e(i['booking_id'])+'">Открыть бронь</a>'
+            if i['url']:
+                body+='<p><a href="'+e(i['url'])+'" target="_blank" rel="noreferrer">Открыть счёт</a></p><label>Ссылка<input readonly value="'+e(i['url'])+'"></label><button type="button" data-copy="'+e(i['url'])+'">Скопировать ссылку</button><span role="status"></span>'
+            if i['state']=='uncertain':body+='<p>Проверьте в PayKeeper счёт с этим номером запроса. Повторное создание заблокировано.</p>'+form(s,'/payments/'+i['request_id']+'/resolve','<label>Номер найденного счёта PayKeeper<input name="invoice_id" maxlength="40" required></label>','Проверить и привязать счёт')
+            for r in await store.pool.fetch('SELECT r.* FROM paykeeper_fiscal_receipts r JOIN paykeeper_payments p USING(payment_id) WHERE p.request_id=$1',i['request_id']):
+                body+='<p><a href="'+e(r['url'])+'" target="_blank" rel="noreferrer">Открыть чек</a></p>'
+            body+='</div>'
+        return web.Response(text=page('Счета',body+'<script src="/payments.js" defer></script>'),content_type='text/html')
+
+    async def payment_create(request):
+        s=await auth(request,True);data=await request.post()
+        await store.create_staff_invoice(s['actor'],str(data.get('operation','')),str(data.get('phone','')),money(data.get('amount','0')),
+                                         str(data.get('payment_type','')),str(data.get('email','')),str(data.get('booking','')).strip() or None)
+        raise web.HTTPFound('/payments')
+
+    async def payment_resolve(request):
+        s=await auth(request,True);data=await request.post()
+        await store.resolve_invoice(s['actor'],request.match_info['id'],str(data.get('invoice_id','')))
+        raise web.HTTPFound('/payments')
+
+    async def payment_js(request):
+        return web.Response(text="document.addEventListener('click',async e=>{const b=e.target.closest('[data-copy]');if(!b)return;const s=b.nextElementSibling;try{await navigator.clipboard.writeText(b.dataset.copy);s.textContent=' Ссылка скопирована';}catch{const i=b.previousElementSibling.querySelector('input');i.focus();i.select();s.textContent=' Скопируйте выделенную ссылку';}});",content_type='text/javascript')
+
     async def style(request):return web.Response(text=STYLE,content_type='text/css')
+    from paykeeper import mount
+    mount(app,store,settings)
+    app.add_routes([web.get('/payments',payments),web.post('/payments',payment_create),web.post('/payments/{id}/resolve',payment_resolve),web.get('/payments.js',payment_js)])
     app.add_routes([web.get('/style.css',style),web.get('/health',health),web.get('/login',login_page),web.get('/login.js',login_js),web.post('/login',login),web.post('/logout',logout),web.get('/',home),web.get('/booking/{id}',detail),web.post('/booking/{id}/{action}',action),web.post('/block',block),web.post('/unblock/{id}',unblock),web.get('/archive',archive),web.get('/audit',audit),web.get('/catalog',catalog),web.post('/holiday',holiday),web.post('/holiday/remove',remove_holiday)])
     return app
 

@@ -30,11 +30,15 @@ async def deliver_once(bot,store):
             await store.delivered(row['id']);return True
         if payment:
             if row['event'].startswith('paylink:') and payment['url']:
-                buttons=[[('🔗 Перейти к оплате',payment['url'])],[('✅ Уже оплатил','payreport:'+payment['id'])],
+                automatic=bool(await store.pool.fetchval('SELECT 1 FROM paykeeper_invoices WHERE request_id=$1',payment['id']))
+                buttons=[[('🔗 Перейти к оплате',payment['url'])],[('Проверить оплату '+rub(payment['amount']) if automatic else '✅ Уже оплатил',('paycheck:' if automatic else 'payreport:')+payment['id'])],
                          [('Открыть бронь','open:'+row['booking_id'])]]
             elif row['recipient'] in store.settings.admin_ids:
                 buttons=[[('✅ Получено '+rub(payment['amount']),'paystaff:yes:'+payment['id'])],
                          [('❌ Деньги не поступили','paystaff:no:'+payment['id'])]]+buttons
+        if row['event'].startswith(('pkreceipt:','pkreceiptadmin:','pkfinal:','pkfinalstaff:')) or (row['event'].startswith('pkpaid:') and 'доступен по кнопке' in row['text']):
+            url=await store.receipt_delivery_url(row['event'])
+            if url:buttons=[[('Открыть чек',url)]]+buttons
         sent=await bot.send_message(row['recipient'],row['text'],reply_markup=kb(buttons))
         if payment and not row['event'].startswith('paylink:') and row['recipient'] in store.settings.admin_ids:
             await store.payment_message_delivered(payment['id'],row['recipient'],sent.message_id)
@@ -58,10 +62,22 @@ async def worker(bot,store):
         except Exception as e:logging.error('Background job failed: %s',type(e).__name__)
         await asyncio.sleep(10)
 
+async def provider_worker(store):
+    while True:
+        try:
+            await store.invoice_once()
+            await store.settlement_once()
+            for _ in range(4):
+                if not await store.poll_once():break
+            for _ in range(4):
+                if not await store.receipt_once():break
+        except Exception as e:logging.error('Payment background job failed: %s',type(e).__name__)
+        await asyncio.sleep(2)
+
 async def main():
     settings=load()
     if not settings.token or not settings.admin_ids or not settings.database_url:raise SystemExit('Configure BOT_TOKEN, DATABASE_URL and ADMIN_TELEGRAM_IDS or OWNER_TELEGRAM_ID.')
-    store=await BookingStore.connect(settings);lock=None;task=None;runner=None
+    store=await BookingStore.connect(settings);lock=None;task=None;payment_task=None;runner=None
     try:
         lock=await store.pool.acquire()
         if not await lock.fetchval('SELECT pg_try_advisory_lock(7319842)'):raise SystemExit('Another bot instance is running.')
@@ -75,9 +91,14 @@ async def main():
                 runner=web.AppRunner(make_app(store,settings),access_log=None);await runner.setup()
                 await web.TCPSite(runner,'0.0.0.0',int(os.getenv('PORT','8080'))).start()
             task=asyncio.create_task(worker(bot,store))
+            if settings.paykeeper_enabled:payment_task=asyncio.create_task(provider_worker(store))
             logging.info('Pihta rental v3 ready; web=%s',bool(settings.web_url))
             await dp.start_polling(bot,allowed_updates=['message','callback_query'])
     finally:
+        if payment_task:
+            payment_task.cancel()
+            try:await payment_task
+            except asyncio.CancelledError:pass
         if task:
             task.cancel()
             try:await task

@@ -50,7 +50,9 @@ def card(row, personal=True):
     start=row['starts_at'].astimezone(TZ);end=row['ends_at'].astimezone(TZ)
     icons={'pending':'⏳','confirmed':'✅','cancelled':'✕','rejected':'✕','expired':'✕','completed':'✓','draft':'✏️'}
     min_age=d.get('guest_min_paid_age',7)
-    lines=[f"Бронь № {row['id']}",f"{icons[row['status']]} {LABELS[row['status']]}",'',f'📅 {start:%d.%m.%Y} · {start:%H:%M}–{end:%H:%M}',
+    due=(row.get('actual_total') if row.get('actual_total') is not None else q['total'])-row.get('paid',0)
+    status_label='Бронь подтверждена, требуется доплата' if row['status']=='confirmed' and due>0 else LABELS[row['status']]
+    lines=[f"Бронь № {row['id']}",f"{icons[row['status']]} {status_label}",'',f'📅 {start:%d.%m.%Y} · {start:%H:%M}–{end:%H:%M}',
            'Время московское','',f"Кол-во гостей: {d['guests']}",f"Гости от {min_age} лет: {d['guests']-d['children']}",
            f"Дети до {min_age-1} лет включительно: {d['children']}",f"Простыни включены: {d['guests']} шт.",'',f"Аренда: {rub(q['rent'])}"]
     if q['guest_extra']:lines.append(f"Доплата за гостей: {rub(q['guest_extra'])}")

@@ -257,10 +257,21 @@ class BookingUI:
             if not r['paid']:
                 rows += [[('💳 Внести предоплату 2 000 ₽','payrequest:deposit:'+ident)],
                          [('💳 Оплатить полностью — '+rub(payment_total(r)),'payrequest:full:'+ident)]]
-            else:rows.append([('💳 Оплатить остаток — '+rub(payment_total(r)-r['paid']),'payrequest:balance:'+ident)])
+            else:rows.append([('💳 Оплатить — '+rub(payment_total(r)-r['paid']),'payrequest:balance:'+ident)])
             requests=await self.store.payment_requests(actor,ident)
             linked=next((req for req in requests if req['url']),None)
-            if linked:rows += [[('🔗 Перейти к оплате',linked['url'])],[('✅ Уже оплатил','payreport:'+linked['id'])]]
+            if linked:
+                automatic=bool(await self.store.pool.fetchval('SELECT 1 FROM paykeeper_invoices WHERE request_id=$1',linked['id']))
+                check_label='Проверить оплату '+rub(linked['amount']) if automatic else '✅ Уже оплатил'
+                check_action=('paycheck:' if automatic else 'payreport:')+linked['id']
+                if automatic:
+                    index=1 if linked['kind']=='full' and not r['paid'] else 0
+                    rows[index]=[(check_label,check_action)]
+                    rows.append([('🔗 Перейти к оплате',linked['url'])])
+                else:
+                    rows += [[('🔗 Перейти к оплате',linked['url'])],[(check_label,check_action)]]
+        if self.settings.paykeeper_enabled:
+            rows.append([('Платежи и чеки','payhistory:'+ident)])
         if r['status'] in ('pending','confirmed'):rows.append([('Отменить бронирование','cancelask:'+ident)])
         rows += [[('☎️ Администратор','contact')],[('← Назад','list:0:0' if r['status'] in ('pending','confirmed') else 'list:1:0')]]
         await self.say(m,card(r),rows+nav(),photo='booking',edit=edit)
@@ -368,7 +379,26 @@ class BookingUI:
             if action=='payrequest':
                 req,created=await self.store.request_payment(actor,parts[2],parts[1])
                 await self.show(m,actor,parts[2],edit=True)
-                await m.answer('Запрос ссылки передан администратору.' if created else 'Запрос уже передан администратору. Ожидайте ссылку.');return
+                await m.answer(('Готовим ссылку PayKeeper. Она придёт отдельным сообщением.' if created else 'Запрос уже сохранён. Используйте действующую ссылку или дождитесь её получения.') if self.settings.paykeeper_enabled else ('Запрос ссылки передан администратору.' if created else 'Запрос уже передан администратору. Ожидайте ссылку.'));return
+            if action=='paycheck':
+                status=await self.store.check_paykeeper(actor,parts[1])
+                ident=await self.store.pool.fetchval('SELECT booking_id FROM paykeeper_invoices WHERE request_id=$1',parts[1])
+                await self.show(m,actor,ident,edit=True)
+                await m.answer({'paid':'Оплата уже учтена. Карточка брони обновлена.','expired':'Срок счёта истёк. Получите новую ссылку; бронь сохранена.'}.get(status,'PayKeeper пока не подтвердил оплату. Повторите проверку позже.'));return
+            if action=='payhistory':
+                payments=await self.store.payment_history(actor,parts[1]);rows=[];text='Платежи и чеки'
+                for p in payments:
+                    text+='\n\n'+p['created_at'].astimezone(TZ).strftime('%d.%m.%Y %H:%M')+' · '+rub(p['amount'])
+                    if p['receipt_url']:rows.append([('Открыть чек · '+rub(p['amount']),p['receipt_url'])])
+                    else:text+='\nЧек формируется.'
+                    if p['disposition']=='review':text+='\nПлатёж требует сверки администратором.'
+                if not payments:text+='\nПоступивших платежей пока нет.'
+                final=await self.store.pool.fetchrow('SELECT state,url FROM paykeeper_settlements WHERE booking_id=$1',parts[1])
+                if final:
+                    text+='\n\nИтоговый чек на оказанную услугу. Повторная оплата не требуется.'
+                    if final['state']=='success':rows.append([('Открыть итоговый чек',final['url'])])
+                    else:text+='\nЧек формируется или проверяется администратором.'
+                await self.say(m,text,rows+[[('← Назад','open:'+parts[1])]]+nav());return
             if action=='payreport':
                 ident,created=await self.store.report_payment(actor,parts[1])
                 await self.show(m,actor,ident,edit=True)

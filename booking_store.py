@@ -10,6 +10,8 @@ import asyncpg
 from booking_domain import TZ,RuleError,estimate,validate_start,can_cancel,card,clean_name,normalize_phone
 from booking_flow import VERSION,require
 from booking_payments import PaymentStore,DEPOSIT,total as payment_total
+from paykeeper_store import PayKeeperStore
+from final_receipts import FinalReceiptStore
 
 SCHEMA='pihta_booking_v2'
 LOCK=7319845
@@ -21,7 +23,7 @@ def unpack(row):
         if key in d and isinstance(d[key],str):d[key]=json.loads(d[key])
     return d
 
-class BookingStore(PaymentStore):
+class BookingStore(FinalReceiptStore,PayKeeperStore,PaymentStore):
     def __init__(self,settings,pool):self.settings,self.pool=settings,pool
 
     @classmethod
@@ -223,6 +225,8 @@ class BookingStore(PaymentStore):
             if await db.fetchval('SELECT key FROM operations WHERE key=$1',key):return
             row=unpack(await db.fetchrow('SELECT * FROM bookings WHERE id=$1 FOR UPDATE',ident))
             if not row:raise RuleError('Бронь не найдена.')
+            if await db.fetchval('SELECT 1 FROM paykeeper_settlements WHERE booking_id=$1',ident):
+                raise RuleError('Итоговый чек уже запрошен. Изменение расчёта требует отдельной сверки и кассовой процедуры.')
             if kind in ('payment','refund'):
                 if type(amount) is not int or not 0<amount<=100000000:raise RuleError('Проверьте сумму.')
                 paid=row['paid']+(amount if kind=='payment' else -amount)
